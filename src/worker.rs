@@ -1,4 +1,7 @@
-use crate::{App, extraction::parse_invoice};
+use crate::{
+    App,
+    extraction::{Context, parse_invoice, parse_invoice_with},
+};
 use anyhow::{Result, anyhow};
 use std::{io::Write, path::Path, process::Stdio};
 
@@ -140,6 +143,33 @@ fn split_pdf(path: &Path, first: usize, last: usize) -> Result<Vec<u8>> {
     Ok(std::fs::read(output)?)
 }
 
+/// The workspace's own store names and addresses. An invoice is addressed to one of them, so
+/// text containing them is the customer and not the supplier.
+fn customer_context(app: &App, workspace: &str) -> Result<Context> {
+    let collapse = |v: &str| {
+        v.to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut customer = Vec::new();
+    for store in app.store.stores(workspace)? {
+        if let Some(name) = store["name"].as_str() {
+            customer.push(collapse(name));
+        }
+        for identifier in store["identifiers"].as_array().into_iter().flatten() {
+            if let Some(text) = identifier.as_str() {
+                customer.push(collapse(text));
+            }
+        }
+    }
+    Ok(Context {
+        customer,
+        known_suppliers: app.store.known_suppliers(workspace)?,
+        ..Default::default()
+    })
+}
+
 pub async fn process(app: &App, job: &crate::reliability::Job) -> Result<()> {
     let account = job.account.as_str();
     let id = job.id.as_str();
@@ -198,7 +228,11 @@ pub async fn process(app: &App, job: &crate::reliability::Job) -> Result<()> {
                 return Ok(());
             }
             let text = result["text"].as_str().unwrap_or("");
-            record.invoice = parse_invoice(text, result["pages"].as_u64().unwrap_or(1) as usize);
+            record.invoice = parse_invoice_with(
+                text,
+                result["pages"].as_u64().unwrap_or(1) as usize,
+                &customer_context(app, account)?,
+            );
             let looks_like_invoice = regex::Regex::new(r"(?i)invoice|facture|credit\s+note")
                 .unwrap()
                 .is_match(text);

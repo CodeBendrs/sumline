@@ -13,4 +13,5 @@ RUN mkdir /app/data && chown invoice:invoice /app/data
 USER invoice
 ENV INVOICE_BIND=0.0.0.0:3030 INVOICE_DATA_DIR=/app/data INVOICE_DEMO=0
 EXPOSE 3030
+HEALTHCHECK --interval=30s --timeout=8s --start-period=15s --retries=3 CMD ["/app/invoice-tracker", "--healthcheck"]
 ENTRYPOINT ["/app/invoice-tracker"]

@@ -19,6 +19,8 @@ const state = {
   search: "",
   store: "",
   mode: "login",
+  mailEnabled: false,
+  resetToken: null,
   policy: null,
   selected: null,
   page: 1,
@@ -176,6 +178,112 @@ $("signout-dialog").addEventListener("close", () => {
 mobileLayout.addEventListener("change", syncResponsiveNavigation);
 syncResponsiveNavigation();
 
+const SIDEBAR_MIN = 200;
+const SIDEBAR_MAX = 420;
+const SIDEBAR_RAIL = 68;
+// width stays null until the person drags the handle, so the stylesheet's
+// responsive default (narrower at tablet widths) keeps applying.
+const sidebarState = { collapsed: false, width: null };
+function defaultSidebarWidth() {
+  return window.innerWidth <= 1100 ? 205 : 245;
+}
+function readSidebarPreference(key) {
+  try {
+    return localStorage.getItem("sumline.sidebar." + key);
+  } catch {
+    return null;
+  }
+}
+function saveSidebarPreference(key, value) {
+  try {
+    localStorage.setItem("sumline.sidebar." + key, String(value));
+  } catch {
+    // Storage can be blocked; the sidebar still works for this visit.
+  }
+}
+function clampSidebarWidth(width) {
+  return Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, Math.round(width)));
+}
+function applySidebar() {
+  const { collapsed, width } = sidebarState;
+  $("app").classList.toggle("sidebar-collapsed", collapsed);
+  if (collapsed) $("app").style.setProperty("--sidebar-w", SIDEBAR_RAIL + "px");
+  else if (width) $("app").style.setProperty("--sidebar-w", width + "px");
+  else $("app").style.removeProperty("--sidebar-w");
+  $("sidebar-toggle").setAttribute("aria-expanded", String(!collapsed));
+  $("sidebar-toggle").setAttribute(
+    "aria-label",
+    collapsed ? "Expand sidebar" : "Collapse sidebar",
+  );
+  $("sidebar-toggle").title = collapsed ? "Expand sidebar" : "Collapse sidebar";
+  $("sidebar-resizer").setAttribute(
+    "aria-valuenow",
+    String(width || defaultSidebarWidth()),
+  );
+  document.querySelectorAll(".sidebar .nav-button").forEach((b) => {
+    const label = b.querySelector(".nav-label");
+    if (collapsed && label) b.title = label.textContent;
+    else b.removeAttribute("title");
+  });
+  $("account-toggle").title = collapsed ? $("account-name").textContent : "";
+  closeAccountMenu();
+}
+function setSidebarCollapsed(collapsed) {
+  sidebarState.collapsed = collapsed;
+  saveSidebarPreference("collapsed", collapsed ? "1" : "0");
+  applySidebar();
+}
+function setSidebarWidth(width, persist = true) {
+  sidebarState.width = width === null ? null : clampSidebarWidth(width);
+  if (persist) saveSidebarPreference("width", sidebarState.width ?? "");
+  applySidebar();
+}
+{
+  const saved = Number(readSidebarPreference("width"));
+  if (Number.isFinite(saved) && saved > 0) {
+    sidebarState.width = clampSidebarWidth(saved);
+  }
+  sidebarState.collapsed = readSidebarPreference("collapsed") === "1";
+}
+applySidebar();
+$("sidebar-toggle").onclick = () => setSidebarCollapsed(!sidebarState.collapsed);
+$("workspace-chip").onclick = () => setSidebarCollapsed(false);
+$("sidebar-resizer").addEventListener("pointerdown", (e) => {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  const handle = e.currentTarget;
+  const left = $("sidebar").getBoundingClientRect().left;
+  handle.setPointerCapture(e.pointerId);
+  $("app").classList.add("sidebar-resizing");
+  const move = (ev) => setSidebarWidth(ev.clientX - left, false);
+  const stop = () => {
+    handle.removeEventListener("pointermove", move);
+    handle.removeEventListener("pointerup", stop);
+    handle.removeEventListener("pointercancel", stop);
+    $("app").classList.remove("sidebar-resizing");
+    saveSidebarPreference("width", sidebarState.width ?? "");
+  };
+  handle.addEventListener("pointermove", move);
+  handle.addEventListener("pointerup", stop);
+  handle.addEventListener("pointercancel", stop);
+});
+$("sidebar-resizer").addEventListener("keydown", (e) => {
+  const step = e.shiftKey ? 48 : 16;
+  const current = sidebarState.width || defaultSidebarWidth();
+  const keys = {
+    ArrowLeft: current - step,
+    ArrowRight: current + step,
+    Home: SIDEBAR_MIN,
+    End: SIDEBAR_MAX,
+  };
+  if (!(e.key in keys)) return;
+  e.preventDefault();
+  setSidebarWidth(keys[e.key]);
+});
+$("sidebar-resizer").addEventListener("dblclick", () =>
+  setSidebarWidth(null),
+);
+
 async function load() {
   try {
     state.me = await api("/api/me");
@@ -225,10 +333,24 @@ function renderUser() {
     .join("");
   $("preview-label").hidden = !state.me.is_sample;
   $("top-bar").hidden = !state.me.is_sample;
+  $("verify-banner").hidden = !(
+    state.me.mail_enabled && state.me.user.email_verified === false
+  );
   $("role-label").textContent =
     state.me.role === "owner" ? "Workspace owner" : "Workspace member";
   $("user-avatar").textContent = state.me.user.email.slice(0, 1).toUpperCase();
   $("user-email").textContent = state.me.user.email;
+  $("account-name").textContent = state.me.user.email;
+  const workspace = state.me.workspaces.find((w) => w.id === state.me.workspace);
+  $("workspace-chip").textContent = (workspace?.name || "W")
+    .slice(0, 1)
+    .toUpperCase();
+  $("workspace-chip").title = workspace?.name || "Workspace";
+  $("workspace-chip").setAttribute(
+    "aria-label",
+    "Workspace: " + (workspace?.name || "") + ". Expand sidebar to switch.",
+  );
+  applySidebar();
 }
 async function refresh() {
   const request = ++state.refreshId;
@@ -312,7 +434,13 @@ function render() {
   $("connect-email").textContent = state.connections?.connections.length
     ? "Email settings"
     : "Connect email";
-  $("header-actions").hidden = !["invoices", "archive"].includes(state.view);
+  const reviewing = state.view === "review";
+  $("header-actions").hidden = !["invoices", "archive", "review"].includes(
+    state.view,
+  );
+  $("connect-email").hidden = reviewing;
+  $("export").hidden = reviewing;
+  $("reread").hidden = !(reviewing && (state.counts.review || 0) > 0);
   if (["invoices", "review", "archive"].includes(state.view)) renderInvoices();
   else if (state.view === "stores") renderStores();
   else if (state.view === "connections") renderConnections();
@@ -569,7 +697,7 @@ async function openRecord(id) {
   state.selected = id;
   const i = r.invoice;
   $("drawer").innerHTML =
-    `<div class="drawer-heading"><div><h2>${esc(i.supplier || "Review invoice")}</h2><small>${esc(i.invoice_number || r.file_name)}</small></div><button id="close-drawer" class="icon-button" aria-label="Close invoice">×</button></div>${badge(r)}${["ready", "approved"].includes(r.status) && i.total_cents != null ? `<div class="checked-total"><small>Invoice total</small><strong class="closing-rule">${esc(amount(i.total_cents, i.currency))}<small>${esc(i.currency)}</small></strong></div>` : ""}<details class="source-disclosure"><summary>Document details</summary><div class="source-details"><div><small>Source</small><strong>${esc(r.source)}${r.email_sender ? " · " + esc(r.email_sender) : ""}</strong></div><div><small>Imported</small><strong>${esc(date(r.imported_at))}</strong></div><div><small>Pages</small><strong>${i.pages || "—"}</strong></div></div></details>${r.email_subject ? `<p class="drawer-note">Email: ${esc(r.email_subject)}</p>` : ""}<a class="secondary" href="/api/invoices/${encodeURIComponent(id)}/document"><svg class="status-icon" viewBox="0 0 20 20" aria-hidden="true"><use href="#t-source"></use></svg> Original PDF</a>${r.original_document_id ? ` <a class="text-link" href="/api/invoices/${encodeURIComponent(r.original_document_id)}/document">Full source attachment</a>` : ""}${i.warnings.length ? `<div class="info-box warn"><ul class="warning-list">${i.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul></div>` : ""}${["processing", "bundle"].includes(r.status) ? `<p class="drawer-note">${r.status === "processing" ? "This document is being processed. Close this panel and check again shortly." : "Each invoice in this attachment has its own record. Review those records independently."}</p>` : `<form id="review-form"><div class="field-grid"><label class="full">Store<select name="store_id" required><option value="">Choose a store</option>${state.me.stores.map((s) => `<option value="${esc(s.id)}" ${s.id === r.store_id ? "selected" : ""}>${esc(s.name)}</option>`).join("")}</select></label><label class="full">Supplier<input name="supplier" value="${esc(i.supplier)}" maxlength="200" required></label><label>Invoice number<input name="invoice_number" value="${esc(i.invoice_number)}" maxlength="100" required></label><label>PO number<input name="po_number" value="${esc(i.po_number)}"></label><label>Invoice date<input name="invoice_date" type="date" value="${esc(i.invoice_date)}" required></label><label>Due date<input name="due_date" type="date" value="${esc(i.due_date)}"></label><label>Currency<input name="currency" value="${esc(i.currency)}" placeholder="CAD" maxlength="3" required></label><label>Subtotal<input name="subtotal" inputmode="decimal" value="${money(i.subtotal_cents)}" required></label><label>Tax<input name="tax" inputmode="decimal" value="${money(i.tax_cents)}" required></label><label>Total<input name="total" inputmode="decimal" value="${money(i.total_cents)}" required></label><label>Balance shown on invoice<input name="balance" inputmode="decimal" value="${money(i.balance_cents)}"></label></div><p id="review-error" class="error" role="alert"></p><div class="drawer-buttons"><button class="primary" type="submit">Save invoice</button><button class="secondary" type="submit" value="next">Save & next</button><button id="exclude" class="secondary" type="button">Exclude</button></div><p class="drawer-note">The original document is preserved. An invoice's stated balance does not confirm whether it has since been paid.</p></form>`}${i.items.length ? `<details class="items-list"><summary>Line items · ${i.items.length}</summary>${i.items.map((item) => `<div class="item-row"><span>${esc(item.description)}<small>${item.sku ? esc(item.sku) + " · " : ""}Qty ${esc(item.quantity || "—")}</small></span><span>${esc(money(item.amount_cents))}</span></div>`).join("")}</details>` : ""}${r.status !== "processing" ? `<button id="delete-invoice" class="text-link delete-link">Delete from archive</button>` : ""}`;
+    `<div class="drawer-heading"><div><h2>${esc(i.supplier || "Review invoice")}</h2><small>${esc(i.invoice_number || r.file_name)}</small></div><button id="close-drawer" class="icon-button" aria-label="Close invoice">×</button></div>${badge(r)}${["ready", "approved"].includes(r.status) && i.total_cents != null ? `<div class="checked-total"><small>Invoice total</small><strong class="closing-rule">${esc(amount(i.total_cents, i.currency))}<small>${esc(i.currency)}</small></strong></div>` : ""}<details class="source-disclosure"><summary>Document details</summary><div class="source-details"><div><small>Source</small><strong>${esc(r.source)}${r.email_sender ? " · " + esc(r.email_sender) : ""}</strong></div><div><small>Imported</small><strong>${esc(date(r.imported_at))}</strong></div><div><small>Pages</small><strong>${i.pages || "—"}</strong></div></div></details>${r.email_subject ? `<p class="drawer-note">Email: ${esc(r.email_subject)}</p>` : ""}<a class="secondary" href="/api/invoices/${encodeURIComponent(id)}/document"><svg class="status-icon" viewBox="0 0 20 20" aria-hidden="true"><use href="#t-source"></use></svg> Original PDF</a>${r.original_document_id ? ` <a class="text-link" href="/api/invoices/${encodeURIComponent(r.original_document_id)}/document">Full source attachment</a>` : ""}${i.remembered_supplier ? `<p class="drawer-note">Supplier recognised from an invoice you approved earlier.</p>` : ""}${i.warnings.length ? `<div class="info-box warn"><ul class="warning-list">${i.warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul></div>` : ""}${["processing", "bundle"].includes(r.status) ? `<p class="drawer-note">${r.status === "processing" ? "This document is being processed. Close this panel and check again shortly." : "Each invoice in this attachment has its own record. Review those records independently."}</p>` : `<form id="review-form"><div class="field-grid"><label class="full">Store<select name="store_id" required><option value="">Choose a store</option>${state.me.stores.map((s) => `<option value="${esc(s.id)}" ${s.id === r.store_id ? "selected" : ""}>${esc(s.name)}</option>`).join("")}</select></label><label class="full">Supplier<input name="supplier" value="${esc(i.supplier)}" maxlength="200" list="supplier-options" autocomplete="off" required></label><datalist id="supplier-options">${state.suppliers.map((name) => `<option value="${esc(name)}"></option>`).join("")}</datalist><label>Invoice number<input name="invoice_number" value="${esc(i.invoice_number)}" maxlength="100" required></label><label>PO number<input name="po_number" value="${esc(i.po_number)}" maxlength="100"></label><label>Invoice date<input name="invoice_date" type="date" value="${esc(i.invoice_date)}" required></label><label>Due date<input name="due_date" type="date" value="${esc(i.due_date)}"></label><label>Currency<select name="currency" required><option value="" ${i.currency ? "" : "selected"}>Choose currency</option>${state.me.currencies.map((code) => `<option value="${esc(code)}" ${code === i.currency ? "selected" : ""}>${esc(code)}</option>`).join("")}</select></label><label>Subtotal<input name="subtotal" type="number" step="0.01" inputmode="decimal" value="${money(i.subtotal_cents)}" required></label><label>Tax<input name="tax" type="number" step="0.01" inputmode="decimal" value="${money(i.tax_cents)}" required></label><label>Total<input name="total" type="number" step="0.01" inputmode="decimal" value="${money(i.total_cents)}" required></label><label>Balance shown on invoice<input name="balance" type="number" step="0.01" inputmode="decimal" value="${money(i.balance_cents)}"></label></div><p id="review-error" class="error" role="alert"></p><div class="drawer-buttons"><button class="primary" type="submit">Save invoice</button><button class="secondary" type="submit" value="next">Save & next</button><button id="exclude" class="secondary" type="button">Exclude</button></div><p class="drawer-note">The original document is preserved. An invoice's stated balance does not confirm whether it has since been paid.</p></form>`}${i.items.length ? `<details class="items-list"><summary>Line items · ${i.items.length}</summary>${i.items.map((item) => `<div class="item-row"><span>${esc(item.description)}<small>${item.sku ? esc(item.sku) + " · " : ""}Qty ${esc(item.quantity || "—")}</small></span><span>${esc(money(item.amount_cents))}</span></div>`).join("")}</details>` : ""}${r.status !== "processing" ? `<button id="delete-invoice" class="text-link delete-link">Delete from archive</button>` : ""}`;
   $("drawer").hidden = false;
   $("drawer").showModal();
   $("close-drawer").onclick = closeDrawer;
@@ -884,31 +1012,96 @@ function bindPolicies() {
     .querySelectorAll(".policy-link")
     .forEach((b) => (b.onclick = openPolicy));
 }
-function authMode(mode) {
+const authCopy = {
+  login: ["Welcome back", "Sign in to your invoice records.", "Sign in"],
+  register: [
+    "Create your workspace",
+    "Start with one store. Add more whenever you need.",
+    "Create account",
+  ],
+  forgot: [
+    "Reset your password",
+    "Enter your account email and we will send a link that works for one hour.",
+    "Send reset link",
+  ],
+  reset: [
+    "Choose a new password",
+    "Use at least 12 characters. You will be signed out everywhere else.",
+    "Set new password",
+  ],
+};
+function authMode(mode, notice = "") {
   state.mode = mode;
   const register = mode === "register";
+  const recovery = mode === "forgot" || mode === "reset";
+  const [title, subtitle, submit] = authCopy[mode];
   $("store-name-label").hidden = !register;
   $("account-consent-label").hidden = !register;
-  $("auth-title").textContent = register
-    ? "Create your workspace"
-    : "Welcome back";
-  $("auth-subtitle").textContent = register
-    ? "Start with one store. Add more whenever you need."
-    : "Sign in to your invoice records.";
-  $("auth-submit").textContent = register ? "Create account" : "Sign in";
-  $("password").autocomplete = register ? "new-password" : "current-password";
-  $("password").minLength = register ? 12 : 1;
-  $("login-tab").classList.toggle("active", !register);
+  $("email-label").hidden = mode === "reset";
+  $("email").required = mode !== "reset";
+  $("password-label").hidden = mode === "forgot";
+  $("password").required = mode !== "forgot";
+  $("forgot-link").hidden = !(mode === "login" && state.mailEnabled);
+  $("back-to-login").hidden = !recovery;
+  document.querySelector(".auth-tabs").hidden = recovery;
+  $("auth-title").textContent = title;
+  $("auth-subtitle").textContent = subtitle;
+  $("auth-submit").textContent = submit;
+  $("password").autocomplete =
+    register || mode === "reset" ? "new-password" : "current-password";
+  $("password").minLength = register || mode === "reset" ? 12 : 1;
+  $("login-tab").classList.toggle("active", mode === "login");
   $("register-tab").classList.toggle("active", register);
   $("auth-error").textContent = "";
+  $("auth-notice").textContent = notice;
+  $("auth-notice").hidden = !notice;
 }
 $("login-tab").onclick = () => authMode("login");
 $("register-tab").onclick = () => authMode("register");
+$("forgot-link").onclick = () => authMode("forgot");
+$("back-to-login").onclick = () => authMode("login");
+$("resend-verification").onclick = async () => {
+  $("resend-verification").disabled = true;
+  try {
+    const result = await api("/api/auth/resend-verification", {
+      method: "POST",
+    });
+    if (result.already_verified) {
+      state.me.user.email_verified = true;
+      $("verify-banner").hidden = true;
+    } else toast("Check your inbox for the confirmation link.");
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    $("resend-verification").disabled = false;
+  }
+};
 $("auth-form").onsubmit = async (e) => {
   e.preventDefault();
   $("auth-submit").disabled = true;
   $("auth-error").textContent = "";
   try {
+    if (state.mode === "forgot") {
+      await api("/api/auth/forgot", {
+        method: "POST",
+        body: { email: $("email").value },
+      });
+      authMode(
+        "forgot",
+        "If an account exists for that address, a reset link is on its way. It works for one hour.",
+      );
+      return;
+    }
+    if (state.mode === "reset") {
+      await api("/api/auth/reset", {
+        method: "POST",
+        body: { token: state.resetToken, password: $("password").value },
+      });
+      state.resetToken = null;
+      $("password").value = "";
+      authMode("login", "Password updated. Sign in with your new password.");
+      return;
+    }
     state.policy = state.policy || (await api("/api/privacy"));
     await api(
       "/api/auth/" + (state.mode === "register" ? "register" : "login"),
@@ -946,6 +1139,23 @@ document
   .querySelectorAll("[data-view]")
   .forEach((b) => (b.onclick = () => navigate(b.dataset.view)));
 $("connect-email").onclick = () => navigate("connections");
+$("reread").onclick = async () => {
+  $("reread").disabled = true;
+  try {
+    const { count } = await api("/api/invoices/reread", { method: "POST" });
+    toast(
+      count
+        ? `Reading ${count} ${count === 1 ? "document" : "documents"} again. Results appear in a moment.`
+        : "Nothing is waiting to be read again.",
+    );
+    await updateList();
+    setTimeout(updateList, 3000);
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    $("reread").disabled = false;
+  }
+};
 $("export").onclick = async () => {
   const params = new URLSearchParams({
     store: state.store,
@@ -1060,7 +1270,33 @@ api("/api/privacy")
     $("demo-area").hidden = !p.demo;
   })
   .catch(() => {});
-load();
+// Links from account emails carry a one-time token. Read it, then remove it from the address bar.
+async function start() {
+  const params = new URLSearchParams(location.search);
+  const verify = params.get("verify");
+  const reset = params.get("reset");
+  if (verify || reset) history.replaceState(null, "", "/");
+  try {
+    state.mailEnabled = (await api("/api/auth/options")).mail_enabled;
+  } catch {}
+  if (reset) {
+    state.resetToken = reset;
+    $("auth").hidden = false;
+    authMode("reset");
+    return;
+  }
+  if (verify) {
+    try {
+      await api("/api/auth/verify", { method: "POST", body: { token: verify } });
+      toast("Email address confirmed.");
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+  authMode("login");
+  await load();
+}
+start();
 setInterval(async () => {
   if (
     document.hidden ||

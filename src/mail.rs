@@ -674,6 +674,7 @@ mod tests {
                 origin: "http://localhost:3030".into(),
                 demo: false,
                 samples: None,
+                trusted_proxies: Vec::new(),
             }),
             http: reqwest::Client::new(),
             queue,
@@ -683,6 +684,7 @@ mod tests {
             auth_attempts: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            mailer: crate::outbound::Mailer::Disabled,
         };
         let tokens = Tokens {
             access: "fake".into(),

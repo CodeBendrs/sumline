@@ -1,4 +1,8 @@
-"""API and real-sample regression checks against an explicitly supplied local preview."""
+"""API and real-sample regression checks against an explicitly supplied local preview.
+
+Run it against an instance WITHOUT SMTP_URL/MAIL_FROM. With outbound mail configured, accounts
+must verify their email before accepting invitations, which these checks do not do; that path is
+covered by the Rust tests in src/accounts.rs."""
 from pathlib import Path
 from urllib.request import Request, build_opener, HTTPCookieProcessor
 from urllib.error import HTTPError

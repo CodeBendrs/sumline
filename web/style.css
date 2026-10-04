@@ -1456,7 +1456,6 @@ td {
 }
 @media (min-width: 1500px) {
   .main {
-    max-width: 1600px;
     padding: 0 55px;
   }
   .page-header {
@@ -2283,4 +2282,361 @@ input[name="balance"] {
   .mobile-navigation .sidebar nav {
     overflow-y: auto;
   }
+}
+
+/* Content fills the space beside the sidebar. The cap only matters on ultra-wide displays. */
+.main {
+  width: 100%;
+  max-width: 2400px;
+  margin-inline: auto;
+}
+@media (max-width: 760px) {
+  .main {
+    max-width: none;
+  }
+}
+
+/* Sidebar header with collapse control, expanding account row, resizable width. */
+.sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 7px 34px;
+}
+.sidebar .sidebar-head .brand {
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+.sidebar > .sidebar-head {
+  flex-shrink: 0;
+}
+.sidebar-toggle,
+.sidebar-resizer,
+.workspace-chip {
+  display: none;
+}
+.account-avatar-dot {
+  display: grid;
+  place-items: center;
+}
+.account-summary,
+.account-chevron {
+  display: none;
+}
+@media (max-width: 760px) {
+  .mobile-navigation .sidebar .sidebar-head {
+    margin: 0 5px 30px;
+    padding-right: 30px;
+  }
+  .account-avatar-dot {
+    display: contents;
+  }
+}
+@media (min-width: 761px) {
+  .app-shell {
+    --sidebar-default: 245px;
+    grid-template-columns: var(--sidebar-w, var(--sidebar-default)) minmax(0, 1fr);
+    transition: grid-template-columns 0.18s ease;
+  }
+  .app-shell.sidebar-resizing {
+    transition: none;
+    cursor: col-resize;
+    user-select: none;
+  }
+  .app-shell.sidebar-resizing * {
+    cursor: col-resize !important;
+  }
+  .sidebar {
+    z-index: 2;
+    min-width: 0;
+  }
+  .sidebar-toggle {
+    display: grid;
+    place-items: center;
+    flex: 0 0 auto;
+    width: 36px;
+    height: 36px;
+    min-width: 36px;
+    min-height: 36px;
+    padding: 0;
+    border: 0;
+    border-radius: 8px;
+    color: var(--ink-2);
+    background: transparent;
+  }
+  .sidebar-toggle:hover {
+    color: var(--ink);
+    background: var(--pad);
+  }
+  .sidebar-toggle svg {
+    width: 20px;
+    height: 20px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.6;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .sidebar-resizer {
+    display: block;
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: -4px;
+    width: 8px;
+    z-index: 3;
+    cursor: col-resize;
+    touch-action: none;
+  }
+  .sidebar-resizer::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 3px;
+    width: 2px;
+    background: transparent;
+    transition: background 0.15s ease;
+  }
+  .sidebar-resizer:hover::after,
+  .sidebar-resizer:focus-visible::after,
+  .sidebar-resizing .sidebar-resizer::after {
+    background: var(--ledger);
+  }
+  .sidebar-resizer:focus-visible {
+    outline: none;
+  }
+
+  .sidebar-bottom {
+    padding-top: 14px;
+  }
+  .account-controls {
+    width: 100%;
+  }
+  #account-toggle {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    height: auto;
+    min-height: 56px;
+    padding: 8px 10px 8px 8px;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    color: var(--ink);
+    background: transparent;
+    font-size: 13px;
+    font-weight: 600;
+    text-align: left;
+  }
+  #account-toggle:hover,
+  #account-toggle[aria-expanded="true"] {
+    border-color: var(--rule);
+    background: var(--pad);
+  }
+  .account-avatar-dot {
+    flex: 0 0 auto;
+    width: 36px;
+    height: 36px;
+    border: 1px solid var(--rule-strong);
+    border-radius: 50%;
+    color: var(--ledger);
+    background: var(--mint);
+    font-size: 15px;
+    font-weight: 650;
+  }
+  .account-summary {
+    display: block;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .account-summary strong {
+    display: block;
+    max-width: none;
+    overflow: hidden;
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 20px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .account-chevron {
+    display: block;
+    flex: 0 0 auto;
+    width: 16px;
+    height: 16px;
+    fill: none;
+    stroke: var(--ink-2);
+    stroke-width: 1.75;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    transition: transform 0.15s ease;
+  }
+  #account-toggle[aria-expanded="true"] .account-chevron {
+    transform: rotate(180deg);
+  }
+  .account-menu {
+    left: 0;
+    right: 0;
+    width: auto;
+  }
+
+  /* Collapsed icon rail */
+  .sidebar-collapsed .sidebar {
+    padding-left: 11px;
+    padding-right: 11px;
+  }
+  .sidebar-collapsed .sidebar > nav {
+    overflow-x: hidden;
+  }
+  .sidebar-collapsed .sidebar-head {
+    flex-direction: column;
+    gap: 14px;
+    margin: 0 0 22px;
+  }
+  .sidebar-collapsed .sidebar .sidebar-head .brand {
+    justify-content: center;
+    width: 44px;
+  }
+  .sidebar-collapsed .wordmark,
+  .sidebar-collapsed .nav-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  .sidebar-collapsed .sidebar-resizer {
+    display: none;
+  }
+  .sidebar-collapsed .workspace-block {
+    display: flex;
+    justify-content: center;
+    margin: 0 0 22px;
+  }
+  .sidebar-collapsed .workspace-block label,
+  .sidebar-collapsed .workspace-block select,
+  .sidebar-collapsed .workspace-block .secondary-text {
+    display: none;
+  }
+  .sidebar-collapsed .workspace-chip {
+    display: grid;
+    place-items: center;
+    width: 40px;
+    height: 40px;
+    padding: 0;
+    border: 1px solid var(--rule-strong);
+    border-radius: 10px;
+    color: var(--ledger);
+    background: var(--mint);
+    font-size: 16px;
+    font-weight: 650;
+  }
+  .sidebar-collapsed .workspace-chip:hover {
+    border-color: var(--ledger);
+  }
+  .sidebar-collapsed .nav-button {
+    position: relative;
+    justify-content: center;
+    width: 44px;
+    padding: 0;
+    margin-inline: auto;
+  }
+  .sidebar-collapsed .nav-count {
+    position: absolute;
+    top: 3px;
+    right: 1px;
+    margin: 0;
+    padding: 1px 5px;
+    font-size: 10px;
+    line-height: 16px;
+  }
+  .sidebar-collapsed .nav-divider {
+    margin: 14px 10px;
+  }
+  .sidebar-collapsed .sidebar-bottom {
+    justify-content: center;
+  }
+  .sidebar-collapsed .account-controls {
+    width: auto;
+  }
+  .sidebar-collapsed #account-toggle {
+    justify-content: center;
+    width: 44px;
+    min-height: 44px;
+    padding: 3px;
+    border-radius: 50%;
+  }
+  .sidebar-collapsed .account-summary,
+  .sidebar-collapsed .account-chevron {
+    display: none;
+  }
+  .sidebar-collapsed .account-menu {
+    top: auto;
+    bottom: 0;
+    left: calc(100% + 14px);
+    right: auto;
+    width: 290px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .app-shell,
+  .account-chevron,
+  .sidebar-resizer::after {
+    transition: none;
+  }
+}
+@media (min-width: 761px) and (max-width: 1100px) {
+  .app-shell {
+    --sidebar-default: 205px;
+  }
+}
+
+/* Account email: recovery links, notices and the unverified-address banner. */
+.auth-secondary-link {
+  display: inline-block;
+  align-self: flex-start;
+  margin: 2px 0 14px;
+  padding: 0;
+  font-size: 14px;
+}
+.auth-notice {
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--mint);
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.5;
+}
+.verify-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  margin: 0 0 16px;
+}
+.verify-banner .text-link {
+  flex: 0 0 auto;
+  color: inherit;
+  font-weight: 650;
+}
+
+/* Amount fields are numeric inputs; the stepper arrows add nothing for money. */
+input[type="number"] {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }

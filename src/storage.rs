@@ -27,6 +27,56 @@ pub fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// Email verification state and single-use verification/reset tokens.
+fn migrate_accounts(db: &Connection) -> Result<()> {
+    let columns: Vec<String> = db
+        .prepare("PRAGMA table_info(accounts)")?
+        .query_map([], |r| r.get(1))?
+        .collect::<std::result::Result<_, _>>()?;
+    if !columns.iter().any(|v| v == "email_verified_at") {
+        db.execute("ALTER TABLE accounts ADD COLUMN email_verified_at TEXT", [])?;
+    }
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS email_tokens(hash TEXT PRIMARY KEY, account TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, purpose TEXT NOT NULL CHECK(purpose IN ('verify','reset')), email TEXT NOT NULL, created INTEGER NOT NULL, expires INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS email_tokens_account ON email_tokens(account,purpose);
+        CREATE TABLE IF NOT EXISTS supplier_profiles(workspace TEXT NOT NULL REFERENCES workspaces(id), key TEXT NOT NULL, supplier TEXT NOT NULL, approved_at TEXT NOT NULL, PRIMARY KEY(workspace,key));",
+    )?;
+    Ok(())
+}
+
+fn hash_password(password: &str) -> Result<String> {
+    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+    Ok(Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|_| anyhow!("Password hashing failed"))?
+        .to_string())
+}
+
+fn unseal_with_cipher(cipher: &Aes256Gcm, account: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    if bytes.len() < 12 {
+        return Err(anyhow!("Invalid encrypted record"));
+    }
+    cipher
+        .decrypt(
+            Nonce::from_slice(&bytes[..12]),
+            Payload {
+                msg: &bytes[12..],
+                aad: account.as_bytes(),
+            },
+        )
+        .map_err(|_| anyhow!("Decryption failed"))
+}
+
+/// Decrypts a stored value with a key file's contents, without opening a `Store`. Used to prove
+/// that a backup and a key belong together.
+pub fn unseal_with_key(key: &[u8], account: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| anyhow!("Invalid encryption key"))?;
+    unseal_with_cipher(&cipher, account, bytes)
+}
+
+/// Minimum seconds between two emails of the same kind for one account.
+pub const EMAIL_TOKEN_COOLDOWN_SECONDS: i64 = 60;
+
 #[derive(Clone)]
 pub struct Store {
     pub db: Arc<Mutex<Connection>>,
@@ -82,6 +132,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS invitations (hash TEXT PRIMARY KEY, workspace TEXT NOT NULL REFERENCES workspaces(id), created_by TEXT NOT NULL REFERENCES accounts(id), email TEXT NOT NULL, expires INTEGER NOT NULL);
         ")?;
         crate::reliability::migrate(&db)?;
+        migrate_accounts(&db)?;
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
             cipher: Arc::new(Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("Key error"))?),
@@ -105,18 +156,7 @@ impl Store {
         Ok(result)
     }
     pub fn unseal(&self, account: &str, bytes: &[u8]) -> Result<Vec<u8>> {
-        if bytes.len() < 12 {
-            return Err(anyhow!("Invalid encrypted record"));
-        }
-        self.cipher
-            .decrypt(
-                Nonce::from_slice(&bytes[..12]),
-                Payload {
-                    msg: &bytes[12..],
-                    aad: account.as_bytes(),
-                },
-            )
-            .map_err(|_| anyhow!("Decryption failed"))
+        unseal_with_cipher(&self.cipher, account, bytes)
     }
     pub fn seal_json<T: Serialize>(&self, account: &str, value: &T) -> Result<Vec<u8>> {
         self.seal(account, &serde_json::to_vec(value)?)
@@ -125,16 +165,12 @@ impl Store {
         Ok(serde_json::from_slice(&self.unseal(account, value)?)?)
     }
     pub fn register(&self, email: &str, password: &str, name: &str) -> Result<String> {
-        let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
-        let encoded = Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
-            .map_err(|_| anyhow!("Password hashing failed"))?
-            .to_string();
+        let encoded = hash_password(password)?;
         let id = uuid::Uuid::new_v4().to_string();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         tx.execute(
-            "INSERT INTO accounts VALUES (?1,?2,?3,?4,?5)",
+            "INSERT INTO accounts(id,email,password,store_name,created_at) VALUES (?1,?2,?3,?4,?5)",
             params![id, email.to_lowercase().trim(), encoded, name, now()],
         )?;
         let workspace = uuid::Uuid::new_v4().to_string();
@@ -205,7 +241,196 @@ impl Store {
         Ok(self.db.lock().unwrap().query_row("SELECT s.account,s.workspace,s.csrf,m.role FROM sessions s JOIN memberships m ON m.user=s.account AND m.workspace=s.workspace WHERE s.hash=?1 AND s.expires>?2",params![hash(session.as_bytes()),chrono::Utc::now().timestamp()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?)
     }
     pub fn account(&self, id: &str) -> Result<serde_json::Value> {
-        Ok(self.db.lock().unwrap().query_row("SELECT email,store_name FROM accounts WHERE id=?1",[id],|r|Ok(serde_json::json!({"id":id,"email":r.get::<_,String>(0)?,"store_name":r.get::<_,String>(1)?})))?)
+        Ok(self.db.lock().unwrap().query_row("SELECT email,store_name,email_verified_at IS NOT NULL FROM accounts WHERE id=?1",[id],|r|Ok(serde_json::json!({"id":id,"email":r.get::<_,String>(0)?,"store_name":r.get::<_,String>(1)?,"email_verified":r.get::<_,bool>(2)?})))?)
+    }
+    /// Remembers the supplier a person confirmed, under each identifier found in the document
+    /// and under the confirmed name itself. The latest approval for an identifier wins.
+    pub fn remember_supplier(
+        &self,
+        workspace: &str,
+        keys: &[String],
+        supplier: &str,
+    ) -> Result<()> {
+        let supplier = supplier.trim();
+        if supplier.is_empty() {
+            return Ok(());
+        }
+        let mut all: std::collections::BTreeSet<String> =
+            keys.iter().filter(|k| k.len() <= 200).cloned().collect();
+        all.insert(crate::supplier::name_key(supplier));
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        for key in all {
+            tx.execute(
+                "INSERT INTO supplier_profiles(workspace,key,supplier,approved_at) VALUES (?1,?2,?3,?4) ON CONFLICT(workspace,key) DO UPDATE SET supplier=excluded.supplier,approved_at=excluded.approved_at",
+                params![workspace, key, supplier, now()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// One-time catch-up for approvals made before supplier memory existed: if nothing has been
+    /// remembered yet, remember the name on every approved invoice. Those names were confirmed
+    /// by a person, so recognising them is safe; it does nothing once any profile exists.
+    pub fn backfill_supplier_profiles(&self) -> Result<usize> {
+        let already: i64 = self.db.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM supplier_profiles",
+            [],
+            |r| r.get(0),
+        )?;
+        if already > 0 {
+            return Ok(0);
+        }
+        let workspaces: Vec<String> = {
+            let db = self.db.lock().unwrap();
+            let mut statement =
+                db.prepare("SELECT DISTINCT account FROM invoices WHERE status='approved'")?;
+            statement
+                .query_map([], |r| r.get(0))?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        let mut remembered = 0;
+        for workspace in workspaces {
+            for record in self.records(&workspace)? {
+                if record.status == "approved" && !record.invoice.supplier.trim().is_empty() {
+                    self.remember_supplier(
+                        &workspace,
+                        &record.invoice.identity_keys,
+                        &record.invoice.supplier,
+                    )?;
+                    remembered += 1;
+                }
+            }
+        }
+        Ok(remembered)
+    }
+    /// Identifier -> the supplier name a person confirmed, for this workspace only.
+    pub fn known_suppliers(
+        &self,
+        workspace: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let db = self.db.lock().unwrap();
+        let mut statement =
+            db.prepare("SELECT key,supplier FROM supplier_profiles WHERE workspace=?1")?;
+        let rows = statement
+            .query_map([workspace], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+    pub fn account_by_email(&self, email: &str) -> Result<Option<(String, String)>> {
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id,email FROM accounts WHERE email=?1",
+                [email.to_lowercase().trim()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+    pub fn email_verified(&self, account: &str) -> Result<bool> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT email_verified_at IS NOT NULL FROM accounts WHERE id=?1",
+            [account],
+            |r| r.get(0),
+        )?)
+    }
+    /// Creates a single-use token and returns it once. Only its hash is stored. Returns `None`
+    /// while a token of the same kind was issued for this account within the cooldown, so the
+    /// endpoint cannot be used to flood a mailbox.
+    pub fn issue_email_token(
+        &self,
+        account: &str,
+        purpose: &str,
+        email: &str,
+        ttl_seconds: i64,
+    ) -> Result<Option<String>> {
+        let now = chrono::Utc::now().timestamp();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute("DELETE FROM email_tokens WHERE expires<?1", [now])?;
+        let recent: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM email_tokens WHERE account=?1 AND purpose=?2 AND created>?3)",
+            params![account, purpose, now - EMAIL_TOKEN_COOLDOWN_SECONDS],
+            |r| r.get(0),
+        )?;
+        if recent {
+            return Ok(None);
+        }
+        tx.execute(
+            "DELETE FROM email_tokens WHERE account=?1 AND purpose=?2",
+            params![account, purpose],
+        )?;
+        let token = random_token();
+        tx.execute(
+            "INSERT INTO email_tokens VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                hash(token.as_bytes()),
+                account,
+                purpose,
+                email,
+                now,
+                now + ttl_seconds
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Some(token))
+    }
+    /// Looks up and deletes a token in one transaction, so it can be used only once.
+    pub fn consume_email_token(
+        &self,
+        purpose: &str,
+        token: &str,
+    ) -> Result<Option<(String, String)>> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let found: Option<(String, String)> = tx
+            .query_row(
+                "SELECT account,email FROM email_tokens WHERE hash=?1 AND purpose=?2 AND expires>?3",
+                params![
+                    hash(token.as_bytes()),
+                    purpose,
+                    chrono::Utc::now().timestamp()
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if found.is_some() {
+            tx.execute(
+                "DELETE FROM email_tokens WHERE hash=?1",
+                [hash(token.as_bytes())],
+            )?;
+        }
+        tx.commit()?;
+        Ok(found)
+    }
+    /// Marks the address verified only if it is still the address the token was sent to.
+    pub fn mark_email_verified(&self, account: &str, email: &str) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        Ok(db.execute(
+            "UPDATE accounts SET email_verified_at=COALESCE(email_verified_at,?3) WHERE id=?1 AND email=?2",
+            params![account, email, now()],
+        )? > 0)
+    }
+    /// Replaces the password, signs the account out everywhere and discards outstanding reset
+    /// tokens. Following a reset link proves control of the mailbox, so the address counts as
+    /// verified.
+    pub fn reset_password(&self, account: &str, password: &str) -> Result<()> {
+        let encoded = hash_password(password)?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
+            "UPDATE accounts SET password=?2,email_verified_at=COALESCE(email_verified_at,?3) WHERE id=?1",
+            params![account, encoded, now()],
+        )?;
+        tx.execute("DELETE FROM sessions WHERE account=?1", [account])?;
+        tx.execute(
+            "DELETE FROM email_tokens WHERE account=?1 AND purpose='reset'",
+            [account],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
     pub fn insert_document(
         &self,
@@ -429,6 +654,72 @@ mod tests {
         assert!(store.unseal(&b, &sealed).is_err());
         assert_eq!(store.unseal(&a, &sealed).unwrap(), b"private invoice");
         assert!(store.login("a@example.com", "wrong").unwrap().is_none());
+    }
+    #[test]
+    fn remembered_suppliers_are_per_workspace_and_the_latest_confirmation_wins() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let a = store
+            .register("a@example.com", "correct horse battery staple", "A")
+            .unwrap();
+        let b = store
+            .register("b@example.com", "correct horse battery staple", "B")
+            .unwrap();
+        let (a, b) = (
+            store.workspace_for_user(&a).unwrap(),
+            store.workspace_for_user(&b).unwrap(),
+        );
+        let keys = vec!["tax:111222333RT0001".to_string()];
+        store
+            .remember_supplier(&a, &keys, "Quartz Valve Corp.")
+            .unwrap();
+        let known = store.known_suppliers(&a).unwrap();
+        assert_eq!(known["tax:111222333RT0001"], "Quartz Valve Corp.");
+        assert_eq!(
+            known["name:quartzvalvecorp"], "Quartz Valve Corp.",
+            "the confirmed name is a key too"
+        );
+        assert!(store.known_suppliers(&b).unwrap().is_empty());
+
+        store
+            .remember_supplier(&a, &keys, "Quartz Valve Corporation")
+            .unwrap();
+        assert_eq!(
+            store.known_suppliers(&a).unwrap()["tax:111222333RT0001"],
+            "Quartz Valve Corporation"
+        );
+        store.remember_supplier(&a, &keys, "   ").unwrap();
+        assert_eq!(
+            store.known_suppliers(&a).unwrap().len(),
+            3,
+            "a blank name remembers nothing"
+        );
+    }
+    #[test]
+    fn earlier_approvals_are_remembered_once_and_only_when_nothing_is_remembered_yet() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let user = store
+            .register("a@example.com", "correct horse battery staple", "A")
+            .unwrap();
+        let workspace = store.workspace_for_user(&user).unwrap();
+        let id = store
+            .insert_document(&workspace, "a.pdf", b"%PDF-approved", "Upload", None, None)
+            .unwrap()
+            .unwrap();
+        let mut record = store.record(&workspace, &id).unwrap().unwrap();
+        record.status = "approved".into();
+        record.invoice.supplier = "Crest Fire Extinguishers Ltd.".into();
+        store.commit_record(&workspace, &record, None).unwrap();
+        assert!(store.known_suppliers(&workspace).unwrap().is_empty());
+
+        assert_eq!(store.backfill_supplier_profiles().unwrap(), 1);
+        assert_eq!(
+            store.known_suppliers(&workspace).unwrap()["name:crestfireextinguishersltd"],
+            "Crest Fire Extinguishers Ltd."
+        );
+        // Already populated: a later start does not rewrite anything.
+        assert_eq!(store.backfill_supplier_profiles().unwrap(), 0);
     }
     #[test]
     fn routing_requires_exactly_one_store_in_the_workspace() {

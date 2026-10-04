@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+/// Currencies a person can choose in review. SumLine serves North American stores for now; the
+/// list lives here so the form, the checks and any later addition stay in one place.
+pub const SUPPORTED_CURRENCIES: [&str; 2] = ["CAD", "USD"];
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LineItem {
     pub description: String,
@@ -27,6 +31,14 @@ pub struct Invoice {
     pub warnings: Vec<String>,
     pub parser: String,
     pub pages: usize,
+    /// Stable identifiers of the supplier found in the document (its tax registration number,
+    /// its normalised name). Saved with the supplier name a person confirms, so later invoices
+    /// from the same supplier are recognised whatever their layout.
+    #[serde(default)]
+    pub identity_keys: Vec<String>,
+    /// The supplier name came from an earlier approval, not from reading this document.
+    #[serde(default)]
+    pub remembered_supplier: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

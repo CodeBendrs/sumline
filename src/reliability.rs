@@ -249,6 +249,46 @@ impl Store {
         tx.commit()?;
         Ok(saved)
     }
+    /// Sends every record that is waiting for review back through processing, so documents are
+    /// read again with the current parser and the workspace's current store addresses. Nothing
+    /// the person has approved or excluded is touched. All of it happens in one transaction.
+    pub fn reread_review(&self, account: &str) -> Result<usize> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let blobs: Vec<Vec<u8>> = tx
+            .prepare("SELECT record FROM invoices WHERE account=?1 AND status='review' LIMIT 500")?
+            .query_map([account], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        let queued: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM invoice_jobs WHERE account=?1",
+            [account],
+            |r| r.get(0),
+        )?;
+        if queued + blobs.len() as i64 > 1000 {
+            return Err(anyhow!("The processing queue is full. Try again shortly."));
+        }
+        for blob in &blobs {
+            let mut record: Record = self.read_json(account, blob)?;
+            record.status = "processing".into();
+            let record = self.write_tx(&tx, account, &record)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO invoice_jobs(id,account,available_at) VALUES (?1,?2,?3)",
+                params![record.id, account, chrono::Utc::now().timestamp()],
+            )?;
+        }
+        if !blobs.is_empty() {
+            tx.execute(
+                "INSERT INTO events(account,time,kind,message) VALUES (?1,?2,'reread',?3)",
+                params![
+                    account,
+                    now(),
+                    format!("{} documents were sent to be read again.", blobs.len())
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(blobs.len())
+    }
     pub fn fail_job(&self, job: &Job) -> Result<()> {
         let Some(mut record) = self.record(&job.account, &job.id)? else {
             return Ok(());
@@ -377,6 +417,51 @@ mod tests {
             1
         );
     }
+    #[test]
+    fn reread_requeues_only_this_workspaces_review_records() {
+        let (_directory, store) = fixture();
+        let mut waiting = add(&store, "a", b"%PDF-waiting");
+        waiting.status = "review".into();
+        let waiting = store.commit_record("a", &waiting, None).unwrap();
+        let mut approved = add(&store, "a", b"%PDF-approved");
+        approved.status = "approved".into();
+        approved.store_id = Some("s1".into());
+        approved.invoice.supplier = "Acme".into();
+        approved.invoice.invoice_number = "1".into();
+        let approved = store.commit_record("a", &approved, None).unwrap();
+        let mut elsewhere = add(&store, "b", b"%PDF-other-workspace");
+        elsewhere.status = "review".into();
+        let elsewhere = store.commit_record("b", &elsewhere, None).unwrap();
+        // Drop the jobs created at upload so only a re-read can create one.
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM invoice_jobs", [])
+            .unwrap();
+
+        assert_eq!(store.reread_review("a").unwrap(), 1);
+        let reread = store.record("a", &waiting.id).unwrap().unwrap();
+        assert_eq!(reread.status, "processing");
+        assert_eq!(reread.revision, waiting.revision + 1);
+        assert_eq!(
+            store.record("a", &approved.id).unwrap().unwrap().status,
+            "approved"
+        );
+        assert_eq!(
+            store.record("b", &elsewhere.id).unwrap().unwrap().status,
+            "review"
+        );
+        let job = store.claim_job().unwrap().expect("a job was queued");
+        assert_eq!(
+            (job.id.as_str(), job.account.as_str()),
+            (waiting.id.as_str(), "a")
+        );
+        assert!(store.claim_job().unwrap().is_none(), "exactly one job");
+        // Nothing is waiting any more, so a second request does nothing.
+        assert_eq!(store.reread_review("a").unwrap(), 0);
+    }
+
     #[test]
     fn review_retry_is_atomic_payload_bound_and_workspace_scoped() {
         let (_directory, store) = fixture();

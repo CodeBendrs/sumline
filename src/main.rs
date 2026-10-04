@@ -1,12 +1,20 @@
+mod accounts;
+mod backup;
 mod branding;
 mod catalog;
 mod extraction;
+mod items;
+mod layout;
 mod mail;
 mod model;
+mod outbound;
 mod privacy;
 mod reliability;
 mod spreadsheet;
 mod storage;
+mod supplier;
+#[cfg(test)]
+mod testkit;
 mod worker;
 
 use anyhow::{Result, anyhow};
@@ -33,6 +41,8 @@ pub struct Config {
     origin: String,
     demo: bool,
     samples: Option<PathBuf>,
+    /// Peers whose `X-Forwarded-For` header is believed (a reverse proxy we run ourselves).
+    trusted_proxies: Vec<std::net::IpAddr>,
 }
 #[derive(Clone)]
 pub struct App {
@@ -42,6 +52,7 @@ pub struct App {
     pub queue: Arc<tokio::sync::Notify>,
     pub sync_locks: Arc<Mutex<HashSet<String>>>,
     auth_attempts: Arc<Mutex<HashMap<String, (std::time::Instant, u32)>>>,
+    mailer: outbound::Mailer,
 }
 
 impl App {
@@ -186,17 +197,40 @@ fn login_response(app: &App, user: &str) -> ApiResult<Response> {
         .into_response())
 }
 
+/// The address rate limits are counted against. Behind a reverse proxy every connection comes
+/// from the proxy, so the forwarded client address is used, but only when the connection really
+/// is from a configured proxy: anyone else could send that header themselves.
+fn client_key(
+    trusted: &[std::net::IpAddr],
+    peer: Option<std::net::IpAddr>,
+    forwarded: Option<&str>,
+) -> String {
+    let Some(peer) = peer else {
+        return "local-test".into();
+    };
+    if trusted.contains(&peer)
+        && let Some(client) = forwarded
+            .and_then(|v| v.rsplit(',').next())
+            .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok())
+    {
+        return client.to_string();
+    }
+    peer.to_string()
+}
+
 async fn security(State(app): State<App>, request: axum::extract::Request, next: Next) -> Response {
     let expected = app
         .config
         .origin
         .trim_start_matches("http://")
         .trim_start_matches("https://");
-    if request
-        .headers()
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        != Some(expected)
+    // Container and uptime probes reach the server by a local name, not the public one.
+    if request.uri().path() != "/healthz"
+        && request
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            != Some(expected)
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -209,13 +243,22 @@ async fn security(State(app): State<App>, request: axum::extract::Request, next:
         {
             return StatusCode::FORBIDDEN.into_response();
         }
-        let key = request
-            .extensions()
-            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-            .map(|v| v.0.ip().to_string())
-            .unwrap_or_else(|| "local-test".into());
+        let key = client_key(
+            &app.config.trusted_proxies,
+            request
+                .extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|v| v.0.ip()),
+            request
+                .headers()
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok()),
+        );
         let limited = {
             let mut attempts = app.auth_attempts.lock().unwrap();
+            if attempts.len() > 10_000 {
+                attempts.retain(|_, entry| entry.0.elapsed().as_secs() <= 60);
+            }
             let entry = attempts
                 .entry(key)
                 .or_insert((std::time::Instant::now(), 0));
@@ -282,6 +325,12 @@ async fn register(State(app): State<App>, Json(body): Json<Credentials>) -> ApiR
         })?;
     let workspace = app.store.workspace_for_user(&user)?;
     app.store.consent(&user, &workspace, "account_processing")?;
+    let verification = app.clone();
+    let address = body.email.trim().to_lowercase();
+    let account = user.clone();
+    tokio::spawn(async move {
+        accounts::send_verification(&verification, &account, &address).await;
+    });
     login_response(&app, &user)
 }
 async fn login(State(app): State<App>, Json(body): Json<Credentials>) -> ApiResult<Response> {
@@ -299,6 +348,20 @@ async fn login(State(app): State<App>, Json(body): Json<Credentials>) -> ApiResu
             )
         })?;
     login_response(&app, &user)
+}
+async fn healthz(State(app): State<App>) -> Response {
+    let healthy = app
+        .store
+        .db
+        .lock()
+        .unwrap()
+        .query_row("SELECT 1", [], |r| r.get::<_, i64>(0))
+        .is_ok();
+    if healthy {
+        (StatusCode::OK, Json(json!({"ok":true}))).into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"ok":false}))).into_response()
+    }
 }
 async fn logout(State(app): State<App>, headers: HeaderMap) -> ApiResult<Response> {
     let context = mutation(&app, &headers)?;
@@ -327,7 +390,7 @@ async fn me(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>
         stmt.query_map([&context.user],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?})))?.collect::<std::result::Result<Vec<_>,_>>()?
     };
     Ok(Json(
-        json!({"user":user,"workspace":context.workspace,"workspaces":workspaces,"role":context.role,"csrf":context.csrf,"stores":app.store.stores(&context.workspace)?,"demo":app.config.demo,"is_sample":sample_workspace(&app,&context.workspace)?,"initial_lookback_days":mail::lookback_days(),"policy_version":privacy::POLICY_VERSION}),
+        json!({"user":user,"workspace":context.workspace,"workspaces":workspaces,"role":context.role,"csrf":context.csrf,"stores":app.store.stores(&context.workspace)?,"demo":app.config.demo,"is_sample":sample_workspace(&app,&context.workspace)?,"initial_lookback_days":mail::lookback_days(),"policy_version":privacy::POLICY_VERSION,"mail_enabled":app.mailer.enabled(),"currencies":model::SUPPORTED_CURRENCIES}),
     ))
 }
 async fn demo(State(app): State<App>) -> ApiResult<Response> {
@@ -526,6 +589,14 @@ struct Review {
     po_number: Option<String>,
     store_id: String,
 }
+async fn reread_review(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    let c = mutation(&app, &headers)?;
+    let count = app.store.reread_review(&c.workspace)?;
+    if count > 0 {
+        app.queue.notify_waiters();
+    }
+    Ok(Json(json!({"count":count})))
+}
 async fn approve(
     State(app): State<App>,
     headers: HeaderMap,
@@ -574,9 +645,18 @@ async fn approve(
     {
         return Err(bad("Enter valid dates."));
     }
-    let currency = body.currency.to_uppercase();
-    if currency.len() != 3 || !currency.chars().all(|c| c.is_ascii_uppercase()) {
-        return Err(bad("Enter a three-letter currency code."));
+    let currency = body.currency.trim().to_uppercase();
+    if !model::SUPPORTED_CURRENCIES.contains(&currency.as_str()) {
+        return Err(bad("Choose CAD or USD."));
+    }
+    let po_number = body
+        .po_number
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    if po_number.as_ref().is_some_and(|v| v.chars().count() > 100) {
+        return Err(bad("The PO number must be 100 characters or fewer."));
     }
     let subtotal =
         model::parse_money(&body.subtotal).ok_or_else(|| bad("Enter a valid subtotal."))?;
@@ -620,13 +700,26 @@ async fn approve(
         .filter(|v| !v.is_empty())
         .map(|value| model::parse_money(value).ok_or_else(|| bad("Enter a valid balance.")))
         .transpose()?;
-    invoice.po_number = body.po_number;
+    invoice.po_number = po_number;
     invoice.warnings.clear();
     record.store_id = Some(body.store_id);
     record.status = "approved".into();
     let record = app
         .store
         .commit_record(&c.workspace, &record, intent.as_ref())?;
+    // The person has confirmed who issued this invoice; recognise that supplier next time.
+    // This is a convenience layered on a saved approval, so a failure here must not undo it.
+    if app
+        .store
+        .remember_supplier(
+            &c.workspace,
+            &record.invoice.identity_keys,
+            &record.invoice.supplier,
+        )
+        .is_err()
+    {
+        eprintln!("A confirmed supplier could not be remembered.");
+    }
     Ok(Json(json!({"invoice":record})))
 }
 async fn exclude(
@@ -1001,6 +1094,16 @@ async fn accept_invite(
     Json(body): Json<InviteAccept>,
 ) -> ApiResult<Json<Value>> {
     let c = mutation(&app, &headers)?;
+    // An invitation is addressed to an email, so only an account that has proven it controls
+    // that address may use it. Without outbound mail nobody can verify, so the gate applies
+    // only when mail is configured (the operator must configure it for any public deployment).
+    if app.mailer.enabled() && !app.store.email_verified(&c.user)? {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "Confirm your email address first. We sent you a link when you created the account."
+                .into(),
+        ));
+    }
     let email = app.store.account(&c.user)?["email"]
         .as_str()
         .unwrap_or("")
@@ -1078,8 +1181,10 @@ fn router(app: App) -> Router {
         .route("/fonts/atkinson-mono.woff2",get(||async {([(header::CONTENT_TYPE,"font/woff2")],include_bytes!("../web/fonts/atkinson-mono.woff2").as_slice())}))
         .route("/api/privacy",get(|State(app):State<App>|async move {Json(json!({"version":privacy::POLICY_VERSION,"notice":privacy::NOTICE.replace("{{PRODUCT_NAME}}",branding::NAME),"demo":app.config.demo}))}))
         .route("/api/auth/register",post(register)).route("/api/auth/login",post(login)).route("/api/auth/demo",post(demo)).route("/api/auth/logout",post(logout))
+        .route("/healthz",get(healthz))
+        .route("/api/auth/options",get(accounts::options)).route("/api/auth/verify",post(accounts::verify)).route("/api/auth/resend-verification",post(accounts::resend_verification)).route("/api/auth/forgot",post(accounts::forgot)).route("/api/auth/reset",post(accounts::reset))
         .route("/api/me",get(me)).route("/api/invoices",get(records)).route("/api/upload",post(upload))
-        .route("/api/invoices/{id}",get(invoice)).route("/api/invoices/{id}/approve",post(approve)).route("/api/invoices/{id}/exclude",post(exclude)).route("/api/invoices/{id}/delete",post(delete_invoice)).route("/api/invoices/{id}/document",get(document))
+        .route("/api/invoices/{id}",get(invoice)).route("/api/invoices/reread",post(reread_review)).route("/api/invoices/{id}/approve",post(approve)).route("/api/invoices/{id}/exclude",post(exclude)).route("/api/invoices/{id}/delete",post(delete_invoice)).route("/api/invoices/{id}/document",get(document))
         .route("/api/export",get(export)).route("/api/stores",post(add_store)).route("/api/stores/{id}",post(update_store))
         .route("/api/connections",get(connections)).route("/api/connections/{provider}/start",post(connect)).route("/api/connections/{provider}/disconnect",post(disconnect)).route("/api/sync",post(sync))
         .route("/api/oauth/{provider}/callback",get(callback)).route("/api/activity",get(activity))
@@ -1099,13 +1204,44 @@ async fn main() -> Result<()> {
         println!("{}", serde_json::to_string(&output)?);
         return Ok(());
     }
+    if args.get(1).map(String::as_str) == Some("--healthcheck") {
+        // For container HEALTHCHECK: the image has no curl. Exit 0 only for an HTTP 200.
+        use std::io::{Read, Write};
+        let bind = std::env::var("INVOICE_BIND").unwrap_or("127.0.0.1:3030".into());
+        let port = bind.rsplit(':').next().unwrap_or("3030");
+        let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}"))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        stream.write_all(b"GET /healthz HTTP/1.0\r\nHost: localhost\r\n\r\n")?;
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply)?;
+        if reply.starts_with("HTTP/1.1 200") || reply.starts_with("HTTP/1.0 200") {
+            return Ok(());
+        }
+        return Err(anyhow!("Health check failed"));
+    }
     if args.get(1).map(String::as_str) == Some("--inspect") {
         let output = worker::extract_child(std::path::Path::new(
             args.get(2).ok_or_else(|| anyhow!("PDF path required"))?,
         ))?;
-        let invoice = extraction::parse_invoice(
+        // Optional extra arguments are the customer's own names or addresses. Set
+        // INVOICE_FORCE_GENERIC=1 to bypass the hard-coded supplier layouts.
+        let context = extraction::Context {
+            force_generic: std::env::var("INVOICE_FORCE_GENERIC").as_deref() == Ok("1"),
+            known_suppliers: Default::default(),
+            customer: args[3..]
+                .iter()
+                .map(|v| {
+                    v.to_lowercase()
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect(),
+        };
+        let invoice = extraction::parse_invoice_with(
             output["text"].as_str().unwrap_or(""),
             output["pages"].as_u64().unwrap_or(1) as usize,
+            &context,
         );
         println!("{}", serde_json::to_string(&invoice)?);
         return Ok(());
@@ -1115,11 +1251,38 @@ async fn main() -> Result<()> {
     } else {
         dotenvy::dotenv().ok();
     }
+    if let Some(command) = args.get(1).map(String::as_str)
+        && (command == "--backup" || command == "--verify-backup")
+    {
+        let data = PathBuf::from(std::env::var("INVOICE_DATA_DIR").unwrap_or("data".into()));
+        let target = args
+            .get(2)
+            .ok_or_else(|| anyhow!("A destination directory (or snapshot file) is required"))?;
+        if command == "--backup" {
+            let snapshot = backup::create(&data, std::path::Path::new(target))?;
+            println!("{}", snapshot.display());
+        } else {
+            let key = std::env::var_os("INVOICE_ENCRYPTION_KEY_FILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| data.join("encryption.key"));
+            let report = backup::verify(std::path::Path::new(target), &key)?;
+            println!(
+                "{}",
+                json!({"integrity":"ok","accounts":report.accounts,"workspaces":report.workspaces,"invoices":report.invoices,"document_decrypted":report.document_decrypted})
+            );
+            if report.document_decrypted == Some(false) {
+                return Err(anyhow!(
+                    "A stored document could not be decrypted with this key"
+                ));
+            }
+        }
+        return Ok(());
+    }
     if args.get(1).map(String::as_str) == Some("--check-config") {
         let origin = std::env::var("INVOICE_ORIGIN").unwrap_or("http://localhost:3030".into());
         println!(
             "{}",
-            json!({"origin":origin,"google_callback":format!("{origin}/api/oauth/google/callback"),"google_configured":(["GOOGLE_CLIENT_ID","GOOGLE_CLIENT_SECRET"].iter().all(|key|std::env::var(key).is_ok_and(|v|!v.trim().is_empty()))),"microsoft_configured":(["MICROSOFT_CLIENT_ID","MICROSOFT_CLIENT_SECRET"].iter().all(|key|std::env::var(key).is_ok_and(|v|!v.trim().is_empty()))),"sample_login_enabled":std::env::var("INVOICE_DEMO").as_deref()==Ok("1"),"initial_lookback_days":mail::lookback_days()})
+            json!({"origin":origin,"google_callback":format!("{origin}/api/oauth/google/callback"),"google_configured":(["GOOGLE_CLIENT_ID","GOOGLE_CLIENT_SECRET"].iter().all(|key|std::env::var(key).is_ok_and(|v|!v.trim().is_empty()))),"microsoft_configured":(["MICROSOFT_CLIENT_ID","MICROSOFT_CLIENT_SECRET"].iter().all(|key|std::env::var(key).is_ok_and(|v|!v.trim().is_empty()))),"smtp_configured":outbound::Mailer::from_env().is_ok_and(|m|m.enabled()),"sample_login_enabled":std::env::var("INVOICE_DEMO").as_deref()==Ok("1"),"initial_lookback_days":mail::lookback_days()})
         );
         return Ok(());
     }
@@ -1137,14 +1300,35 @@ async fn main() -> Result<()> {
     if demo && (!local || !bind.starts_with("127.0.0.1:")) {
         return Err(anyhow!("Sample workspace mode is only allowed on loopback"));
     }
+    let mailer = outbound::Mailer::from_env()?;
+    if !local
+        && !mailer.enabled()
+        && std::env::var("INVOICE_ALLOW_UNVERIFIED_EMAIL").as_deref() != Ok("1")
+    {
+        return Err(anyhow!(
+            "Public deployments need SMTP_URL and MAIL_FROM so account emails can be verified and passwords reset"
+        ));
+    }
+    let trusted_proxies = std::env::var("INVOICE_TRUSTED_PROXY")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            v.parse::<std::net::IpAddr>()
+                .map_err(|_| anyhow!("INVOICE_TRUSTED_PROXY must list IP addresses"))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let config = Config {
         origin: origin.clone(),
         demo,
         samples: std::env::var("INVOICE_SAMPLE_DIR").ok().map(PathBuf::from),
+        trusted_proxies,
     };
     let data = PathBuf::from(std::env::var("INVOICE_DATA_DIR").unwrap_or("data".into()));
     let store = Store::open(&data)?;
     store.backfill_store_metadata()?;
+    store.backfill_supplier_profiles()?;
     let queue = Arc::new(tokio::sync::Notify::new());
     let app = App {
         store,
@@ -1156,6 +1340,7 @@ async fn main() -> Result<()> {
             .build()?,
         sync_locks: Arc::new(Mutex::new(HashSet::new())),
         auth_attempts: Arc::new(Mutex::new(HashMap::new())),
+        mailer,
     };
     let workers = std::env::var("INVOICE_WORKERS")
         .ok()
@@ -1177,4 +1362,163 @@ async fn main() -> Result<()> {
     })
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_key;
+    use crate::testkit::*;
+    use axum::http::StatusCode;
+    use serde_json::{Value, json};
+    use std::net::IpAddr;
+
+    /// A record waiting for review in the session's workspace, plus the store to assign it to.
+    async fn waiting_record(f: &Fixture, session: &Session) -> (String, String) {
+        let profile = me(&f.app, session).await;
+        let workspace = profile["workspace"].as_str().unwrap().to_string();
+        let store = profile["stores"][0]["id"].as_str().unwrap().to_string();
+        let id = f
+            .app
+            .store
+            .insert_document(&workspace, "a.pdf", b"%PDF-review", "Upload", None, None)
+            .unwrap()
+            .unwrap();
+        let mut record = f.app.store.record(&workspace, &id).unwrap().unwrap();
+        record.status = "review".into();
+        f.app
+            .store
+            .commit_record(&workspace, &record, None)
+            .unwrap();
+        (id, store)
+    }
+    #[tokio::test]
+    async fn approving_an_invoice_remembers_the_confirmed_supplier_for_that_workspace_only() {
+        let f = fixture(false);
+        let session = register(&f.app, "owner@example.test").await;
+        let other = register(&f.app, "other@example.test").await;
+        let (id, store) = waiting_record(&f, &session).await;
+        let workspace = me(&f.app, &session).await["workspace"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Pretend the reader had found this tax number beside the supplier.
+        let mut record = f.app.store.record(&workspace, &id).unwrap().unwrap();
+        record.invoice.identity_keys = vec!["tax:817712326RT0001".into(), "name:actmeparts".into()];
+        let record = f
+            .app
+            .store
+            .commit_record(&workspace, &record, None)
+            .unwrap();
+
+        let (status, reply, _) = call(
+            &f.app,
+            "POST",
+            &format!("/api/invoices/{id}/approve"),
+            Some(form(&store, record.revision)),
+            Some(&session),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        let known = f.app.store.known_suppliers(&workspace).unwrap();
+        assert_eq!(
+            known.get("tax:817712326RT0001").map(String::as_str),
+            Some("Acme Parts Ltd")
+        );
+        assert_eq!(
+            known.get("name:acmepartsltd").map(String::as_str),
+            Some("Acme Parts Ltd")
+        );
+
+        let other_workspace = me(&f.app, &other).await["workspace"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            f.app
+                .store
+                .known_suppliers(&other_workspace)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn form(store: &str, revision: i64) -> Value {
+        json!({"revision":revision,"supplier":"Acme Parts Ltd","invoice_number":"A-1","invoice_date":"2026-10-01","due_date":"2026-10-31","currency":"CAD","subtotal":"100.00","tax":"5.00","total":"105.00","balance":"","po_number":"","store_id":store})
+    }
+
+    #[tokio::test]
+    async fn the_review_form_only_accepts_the_offered_currencies() {
+        let f = fixture(false);
+        let session = register(&f.app, "owner@example.test").await;
+        assert_eq!(
+            me(&f.app, &session).await["currencies"],
+            json!(["CAD", "USD"]),
+            "the form reads its list from the server"
+        );
+        let (id, store) = waiting_record(&f, &session).await;
+        let path = format!("/api/invoices/{id}/approve");
+        for bad in ["EUR", "", "C$", "CADX"] {
+            let mut body = form(&store, 1);
+            body["currency"] = json!(bad);
+            let (status, reply, _) = call(&f.app, "POST", &path, Some(body), Some(&session)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}");
+            assert_eq!(reply["error"], "Choose CAD or USD.");
+        }
+        let mut body = form(&store, 1);
+        body["currency"] = json!("usd");
+        let (status, reply, _) = call(&f.app, "POST", &path, Some(body), Some(&session)).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        assert_eq!(reply["invoice"]["invoice"]["currency"], "USD");
+        assert_eq!(reply["invoice"]["status"], "approved");
+    }
+
+    #[tokio::test]
+    async fn the_po_number_is_trimmed_bounded_and_optional() {
+        let f = fixture(false);
+        let session = register(&f.app, "owner@example.test").await;
+        let (id, store) = waiting_record(&f, &session).await;
+        let path = format!("/api/invoices/{id}/approve");
+        let mut body = form(&store, 1);
+        body["po_number"] = json!("x".repeat(101));
+        let (status, _, _) = call(&f.app, "POST", &path, Some(body), Some(&session)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let mut body = form(&store, 1);
+        body["po_number"] = json!("   ");
+        let (status, reply, _) = call(&f.app, "POST", &path, Some(body), Some(&session)).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        assert!(reply["invoice"]["invoice"]["po_number"].is_null());
+    }
+
+    fn ip(value: &str) -> IpAddr {
+        value.parse().unwrap()
+    }
+
+    #[test]
+    fn forwarded_address_is_only_believed_from_a_configured_proxy() {
+        let proxies = [ip("127.0.0.1")];
+        // The proxy appends the real client last; earlier entries are client-supplied.
+        assert_eq!(
+            client_key(
+                &proxies,
+                Some(ip("127.0.0.1")),
+                Some("6.6.6.6, 203.0.113.9")
+            ),
+            "203.0.113.9"
+        );
+        // A direct caller cannot choose its own rate-limit bucket.
+        assert_eq!(
+            client_key(&proxies, Some(ip("198.51.100.4")), Some("203.0.113.9")),
+            "198.51.100.4"
+        );
+        // Nothing configured: always the connecting address.
+        assert_eq!(
+            client_key(&[], Some(ip("127.0.0.1")), Some("203.0.113.9")),
+            "127.0.0.1"
+        );
+        // A garbage header from the proxy falls back to the proxy address.
+        assert_eq!(
+            client_key(&proxies, Some(ip("127.0.0.1")), Some("not-an-ip")),
+            "127.0.0.1"
+        );
+    }
 }

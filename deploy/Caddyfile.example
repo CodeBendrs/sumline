@@ -1,0 +1,11 @@
+# Reverse proxy that terminates HTTPS for SumLine (Caddy obtains and renews the certificate).
+# Replace the host name, point its DNS A/AAAA record at this server, and run the app bound to
+# loopback with INVOICE_ORIGIN=https://<same host> and INVOICE_TRUSTED_PROXY=127.0.0.1.
+sumline.example.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:3030 {
+		# Make the last X-Forwarded-For entry the real visitor, so rate limits count visitors
+		# instead of the proxy. The app ignores this header from anyone but INVOICE_TRUSTED_PROXY.
+		header_up X-Forwarded-For {remote_host}
+	}
+}
