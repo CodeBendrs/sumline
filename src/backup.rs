@@ -45,8 +45,7 @@ pub fn create(data_dir: &Path, destination: &Path) -> Result<PathBuf> {
 
 /// Opens the snapshot read-only, runs SQLite's integrity check, counts the main tables and, when
 /// the snapshot has any documents, decrypts one with the key to prove they belong together.
-pub fn verify(snapshot: &Path, key_file: &Path) -> Result<Report> {
-    let key = std::fs::read(key_file).map_err(|_| anyhow!("The key file could not be read"))?;
+pub fn verify(snapshot: &Path, key: &[u8]) -> Result<Report> {
     let db = Connection::open_with_flags(
         snapshot,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -64,7 +63,7 @@ pub fn verify(snapshot: &Path, key_file: &Path) -> Result<Report> {
         })
         .optional()?;
     let document_decrypted =
-        sample.map(|(workspace, sealed)| unseal_with_key(&key, &workspace, &sealed).is_ok());
+        sample.map(|(workspace, sealed)| unseal_with_key(key, &workspace, &sealed).is_ok());
     Ok(Report {
         accounts: count("accounts")?,
         workspaces: count("workspaces")?,
@@ -104,17 +103,16 @@ mod tests {
         let backups = tempfile::tempdir().unwrap();
         let snapshot = create(dir.path(), backups.path()).unwrap();
 
-        let report = verify(&snapshot, &dir.path().join("encryption.key")).unwrap();
+        let key = std::fs::read(dir.path().join("encryption.key")).unwrap();
+        let report = verify(&snapshot, &key).unwrap();
         assert_eq!(
             (report.accounts, report.workspaces, report.invoices),
             (1, 1, 1)
         );
         assert_eq!(report.document_decrypted, Some(true));
 
-        let wrong = backups.path().join("wrong.key");
-        std::fs::write(&wrong, [7u8; 32]).unwrap();
         assert_eq!(
-            verify(&snapshot, &wrong).unwrap().document_decrypted,
+            verify(&snapshot, &[7u8; 32]).unwrap().document_decrypted,
             Some(false)
         );
     }
@@ -130,7 +128,8 @@ mod tests {
             *byte ^= 0xFF;
         }
         std::fs::write(&snapshot, bytes).unwrap();
-        assert!(verify(&snapshot, &dir.path().join("encryption.key")).is_err());
+        let key = std::fs::read(dir.path().join("encryption.key")).unwrap();
+        assert!(verify(&snapshot, &key).is_err());
     }
 
     #[test]

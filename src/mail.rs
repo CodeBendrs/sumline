@@ -965,6 +965,8 @@ mod tests {
                 demo: false,
                 samples: None,
                 trusted_proxies: Vec::new(),
+                signup_code: None,
+                operator: crate::legal::Operator::default(),
                 gmail_api: GMAIL_API.into(),
                 graph_api: GRAPH_API.into(),
             }),
@@ -1002,6 +1004,8 @@ mod tests {
             demo: false,
             samples: None,
             trusted_proxies: Vec::new(),
+            signup_code: None,
+            operator: crate::legal::Operator::default(),
             gmail_api: GMAIL_API.into(),
             graph_api: GRAPH_API.into(),
         };

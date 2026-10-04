@@ -20,18 +20,26 @@ pub struct Fixture {
     pub _dir: tempfile::TempDir,
 }
 pub fn fixture(mail: bool) -> Fixture {
+    fixture_with(mail, |_| {})
+}
+/// A fixture whose configuration the test may adjust (origin, signup code ...).
+pub fn fixture_with(mail: bool, tweak: impl FnOnce(&mut Config)) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let outbox = Arc::new(Mutex::new(Vec::new()));
+    let mut config = Config {
+        origin: ORIGIN.into(),
+        demo: false,
+        samples: None,
+        trusted_proxies: Vec::new(),
+        signup_code: None,
+        operator: crate::legal::Operator::default(),
+        gmail_api: crate::mail::GMAIL_API.into(),
+        graph_api: crate::mail::GRAPH_API.into(),
+    };
+    tweak(&mut config);
     let app = App {
         store: Store::open(dir.path()).unwrap(),
-        config: Arc::new(Config {
-            origin: ORIGIN.into(),
-            demo: false,
-            samples: None,
-            trusted_proxies: Vec::new(),
-            gmail_api: crate::mail::GMAIL_API.into(),
-            graph_api: crate::mail::GRAPH_API.into(),
-        }),
+        config: Arc::new(config),
         http: reqwest::Client::new(),
         queue: Arc::new(tokio::sync::Notify::new()),
         sync_locks: Arc::new(Mutex::new(HashSet::new())),
@@ -54,18 +62,25 @@ pub struct Session {
     pub cookie: String,
     pub csrf: String,
 }
-pub async fn call(
+/// Sends a request through the real router and returns the untouched response.
+pub async fn raw(
     app: &App,
     method: &str,
     path: &str,
     body: Option<Value>,
     session: Option<&Session>,
-) -> (StatusCode, Value, Option<String>) {
+) -> axum::response::Response {
+    let host = app
+        .config
+        .origin
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string();
     let mut request = Request::builder()
         .method(method)
         .uri(path)
-        .header("host", "localhost:3030")
-        .header("origin", ORIGIN)
+        .header("host", host)
+        .header("origin", app.config.origin.as_str())
         .header("content-type", "application/json");
     if let Some(session) = session {
         request = request
@@ -75,10 +90,19 @@ pub async fn call(
     let body = body
         .map(|v| Body::from(v.to_string()))
         .unwrap_or_else(Body::empty);
-    let response = router(app.clone())
+    router(app.clone())
         .oneshot(request.body(body).unwrap())
         .await
-        .unwrap();
+        .unwrap()
+}
+pub async fn call(
+    app: &App,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    session: Option<&Session>,
+) -> (StatusCode, Value, Option<String>) {
+    let response = raw(app, method, path, body, session).await;
     let status = response.status();
     let cookie = response
         .headers()
@@ -98,7 +122,7 @@ pub async fn register(app: &App, email: &str) -> Session {
         app,
         "POST",
         "/api/auth/register",
-        Some(json!({"email":email,"password":PASSWORD,"store_name":"Test","consent":true,"policy_version":crate::privacy::POLICY_VERSION})),
+        Some(json!({"email":email,"password":PASSWORD,"store_name":"Test","consent":true,"policy_version":crate::legal::POLICY_VERSION})),
         None,
     )
     .await;

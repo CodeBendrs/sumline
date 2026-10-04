@@ -20,11 +20,13 @@ pub enum Mailer {
     Smtp {
         transport: Box<AsyncSmtpTransport<Tokio1Executor>>,
         from: Mailbox,
+        reply_to: Option<Mailbox>,
     },
     Resend {
         client: reqwest::Client,
         api_key: String,
         from: String,
+        reply_to: Option<String>,
         /// Always Resend's address outside tests, which point it at a fake.
         endpoint: String,
     },
@@ -69,14 +71,22 @@ fn validate_smtp_url(raw: &str) -> Result<url::Url> {
 }
 
 impl Mailer {
-    /// Reads `RESEND_API_KEY` or `SMTP_URL`, with `MAIL_FROM`. Returns `Disabled` when none are
-    /// set.
+    /// Reads `RESEND_API_KEY` or `SMTP_URL`, with `MAIL_FROM`. Replies go to `MAIL_REPLY_TO`,
+    /// or to the privacy contact when that is not set, because the sending address is a
+    /// no-reply one. Returns `Disabled` when no backend is set.
     pub fn from_env() -> Result<Self> {
-        let var = |name: &str| std::env::var(name).ok();
+        let var = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let reply_to = var("MAIL_REPLY_TO").or_else(|| var("INVOICE_PRIVACY_EMAIL"));
         Self::from_settings(
             var("SMTP_URL").as_deref(),
             var("RESEND_API_KEY").as_deref(),
             var("MAIL_FROM").as_deref(),
+            reply_to.as_deref(),
         )
     }
 
@@ -84,10 +94,18 @@ impl Mailer {
         smtp_url: Option<&str>,
         resend_key: Option<&str>,
         from: Option<&str>,
+        reply_to: Option<&str>,
     ) -> Result<Self> {
         fn clean(v: Option<&str>) -> Option<&str> {
             v.map(str::trim).filter(|v| !v.is_empty())
         }
+        let reply_to: Option<Mailbox> = clean(reply_to)
+            .map(|address| {
+                address.parse().map_err(|_| {
+                    anyhow!("The reply-to address (MAIL_REPLY_TO or INVOICE_PRIVACY_EMAIL) is not a valid mailbox")
+                })
+            })
+            .transpose()?;
         match (clean(smtp_url), clean(resend_key), clean(from)) {
             (None, None, None) => Ok(Self::Disabled),
             (Some(_), Some(_), _) => Err(anyhow!("Set only one of SMTP_URL and RESEND_API_KEY")),
@@ -107,6 +125,7 @@ impl Mailer {
                 Ok(Self::Smtp {
                     transport: Box::new(transport),
                     from,
+                    reply_to,
                 })
             }
             (None, Some(key), Some(from)) => {
@@ -125,6 +144,7 @@ impl Mailer {
                     client,
                     api_key: key.to_string(),
                     from: from.to_string(),
+                    reply_to: reply_to.map(|mailbox| mailbox.email.to_string()),
                     endpoint: RESEND_ENDPOINT.into(),
                 })
             }
@@ -149,11 +169,17 @@ impl Mailer {
     pub async fn send(&self, to: &str, subject: &str, body: String) -> Result<()> {
         match self {
             Self::Disabled => Err(anyhow!("Outbound email is not configured")),
-            Self::Smtp { transport, from } => {
+            Self::Smtp {
+                transport,
+                from,
+                reply_to,
+            } => {
                 let to: Mailbox = to.parse().map_err(|_| anyhow!("Invalid recipient"))?;
-                let message = Message::builder()
-                    .from(from.clone())
-                    .to(to)
+                let mut builder = Message::builder().from(from.clone()).to(to);
+                if let Some(reply_to) = reply_to {
+                    builder = builder.reply_to(reply_to.clone());
+                }
+                let message = builder
                     .subject(subject)
                     .header(ContentType::TEXT_PLAIN)
                     .body(body)
@@ -168,19 +194,24 @@ impl Mailer {
                 client,
                 api_key,
                 from,
+                reply_to,
                 endpoint,
             } => {
                 // Parsing first rejects anything that is not a plain address.
                 let to: Mailbox = to.parse().map_err(|_| anyhow!("Invalid recipient"))?;
+                let mut payload = serde_json::json!({
+                    "from": from,
+                    "to": [to.email.to_string()],
+                    "subject": subject,
+                    "text": body,
+                });
+                if let Some(reply_to) = reply_to {
+                    payload["reply_to"] = serde_json::json!([reply_to]);
+                }
                 let response = client
                     .post(endpoint)
                     .bearer_auth(api_key)
-                    .json(&serde_json::json!({
-                        "from": from,
-                        "to": [to.email.to_string()],
-                        "subject": subject,
-                        "text": body,
-                    }))
+                    .json(&payload)
                     .send()
                     .await
                     .map_err(|_| anyhow!("The mail service could not be reached"))?;
@@ -229,17 +260,17 @@ mod tests {
 
     #[test]
     fn exactly_one_backend_is_chosen_and_mistakes_are_refused() {
-        let disabled = Mailer::from_settings(None, None, None).unwrap();
+        let disabled = Mailer::from_settings(None, None, None, None).unwrap();
         assert!(!disabled.enabled());
         let from = Some("SumLine <no-reply@mail.example.test>");
         assert_eq!(
-            Mailer::from_settings(None, Some("re_abcdefgh1234"), from)
+            Mailer::from_settings(None, Some("re_abcdefgh1234"), from, None)
                 .unwrap()
                 .provider(),
             Some("resend")
         );
         assert_eq!(
-            Mailer::from_settings(Some("smtp://127.0.0.1:2525"), None, from)
+            Mailer::from_settings(Some("smtp://127.0.0.1:2525"), None, from, None)
                 .unwrap()
                 .provider(),
             Some("smtp")
@@ -247,16 +278,40 @@ mod tests {
         // Both at once is ambiguous; a sender without a backend, or a backend without a
         // sender, is a half-finished setup; keys and addresses must look right.
         assert!(
-            Mailer::from_settings(Some("smtp://127.0.0.1:2525"), Some("re_abcdefgh1234"), from)
+            Mailer::from_settings(
+                Some("smtp://127.0.0.1:2525"),
+                Some("re_abcdefgh1234"),
+                from,
+                None
+            )
+            .is_err()
+        );
+        assert!(Mailer::from_settings(None, None, from, None).is_err());
+        assert!(Mailer::from_settings(None, Some("re_abcdefgh1234"), None, None).is_err());
+        assert!(Mailer::from_settings(Some("smtp://127.0.0.1:2525"), None, None, None).is_err());
+        assert!(Mailer::from_settings(None, Some("short"), from, None).is_err());
+        // A reply-to must be a plain mailbox; a blank one means none.
+        assert!(
+            Mailer::from_settings(None, Some("re_abcdefgh1234"), from, Some("not an address"))
                 .is_err()
         );
-        assert!(Mailer::from_settings(None, None, from).is_err());
-        assert!(Mailer::from_settings(None, Some("re_abcdefgh1234"), None).is_err());
-        assert!(Mailer::from_settings(Some("smtp://127.0.0.1:2525"), None, None).is_err());
-        assert!(Mailer::from_settings(None, Some("short"), from).is_err());
-        assert!(Mailer::from_settings(None, Some("re_has a space"), from).is_err());
         assert!(
-            Mailer::from_settings(None, Some("re_abcdefgh1234"), Some("not an address")).is_err()
+            Mailer::from_settings(None, Some("re_abcdefgh1234"), from, Some("  ")).is_ok(),
+            "blank reply-to is the same as unset"
+        );
+        assert!(
+            Mailer::from_settings(
+                None,
+                Some("re_abcdefgh1234"),
+                from,
+                Some("Support <support@example.test>")
+            )
+            .is_ok()
+        );
+        assert!(Mailer::from_settings(None, Some("re_has a space"), from, None).is_err());
+        assert!(
+            Mailer::from_settings(None, Some("re_abcdefgh1234"), Some("not an address"), None)
+                .is_err()
         );
     }
 }
@@ -321,6 +376,7 @@ mod resend {
                 .unwrap(),
             api_key: KEY.into(),
             from: "SumLine <no-reply@mail.example.test>".into(),
+            reply_to: Some("support@example.test".into()),
             endpoint: format!("{base}/emails"),
         };
         (mailer, fake)
@@ -350,6 +406,38 @@ mod resend {
         assert_eq!(body["subject"], "Reset your SumLine password");
         assert_eq!(body["text"], "the body");
         assert!(body.get("html").is_none());
+        assert_eq!(
+            body["reply_to"],
+            json!(["support@example.test"]),
+            "replies reach a monitored address, not the no-reply sender"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_reply_to_the_field_is_left_out() {
+        let (mailer, fake) = start().await;
+        let Mailer::Resend {
+            client,
+            api_key,
+            from,
+            endpoint,
+            ..
+        } = mailer
+        else {
+            unreachable!()
+        };
+        let plain = Mailer::Resend {
+            client,
+            api_key,
+            from,
+            reply_to: None,
+            endpoint,
+        };
+        plain
+            .send("owner@example.test", "s", "b".into())
+            .await
+            .unwrap();
+        assert!(fake.requests.lock().unwrap()[0].1.get("reply_to").is_none());
     }
 
     #[tokio::test]
@@ -370,6 +458,7 @@ mod resend {
             client,
             api_key,
             from,
+            reply_to,
             ..
         } = mailer
         else {
@@ -379,6 +468,7 @@ mod resend {
             client,
             api_key,
             from,
+            reply_to,
             endpoint: "http://127.0.0.1:9/emails".into(),
         };
         let text = format!(

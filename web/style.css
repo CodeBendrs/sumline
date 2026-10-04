@@ -2640,3 +2640,76 @@ input[type="number"]::-webkit-inner-spin-button {
   -webkit-appearance: none;
   margin: 0;
 }
+
+
+/* Public privacy policy and terms pages, and the delete-account control. */
+.legal-page {
+  background: var(--pad);
+  color: var(--ink);
+}
+.legal-header,
+.legal-footer {
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 24px 20px;
+}
+.legal-header a,
+.legal-footer a,
+.legal-article a {
+  color: var(--ledger);
+}
+.legal-article {
+  max-width: 800px;
+  margin: 0 auto 8px;
+  padding: 12px 36px 28px;
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  background: var(--sheet);
+  line-height: 1.65;
+}
+.legal-article h1 {
+  margin: 24px 0 4px;
+  font-size: 30px;
+}
+.legal-article h2 {
+  margin: 28px 0 6px;
+  font-size: 19px;
+}
+.legal-article p,
+.legal-article li {
+  margin: 8px 0;
+}
+.legal-article ul {
+  padding-left: 22px;
+}
+.legal-links {
+  font-size: 13px;
+}
+.legal-links a {
+  color: var(--ink-2);
+}
+.danger-card {
+  border-color: var(--stop);
+}
+.danger-card h3 {
+  color: var(--stop);
+}
+.danger-button {
+  min-height: 44px;
+  padding: 0 20px;
+  border: 0;
+  border-radius: 9px;
+  color: #fff;
+  background: var(--stop);
+  font-weight: 650;
+}
+.danger-button:hover {
+  filter: brightness(0.92);
+}
+@media (max-width: 760px) {
+  .legal-article {
+    margin: 0 12px 8px;
+    padding: 8px 20px 24px;
+  }
+}
+

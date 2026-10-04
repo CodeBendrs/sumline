@@ -1,0 +1,11 @@
+# Railway settings, versioned with the code. Values here override the dashboard.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# /healthz answers 2xx whenever the database does, for any Host header (Railway checks as
+# healthcheck.railway.app).
+healthcheckPath = "/healthz"
+healthcheckTimeout = 120
+restartPolicyType = "ALWAYS"

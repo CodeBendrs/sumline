@@ -9,9 +9,12 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates poppler-utils && rm -rf /var/lib/apt/lists/* && useradd --create-home --uid 10001 invoice
 WORKDIR /app
 COPY --from=build /app/target/release/invoice-tracker /app/invoice-tracker
-RUN mkdir /app/data && chown invoice:invoice /app/data
-USER invoice
-ENV INVOICE_BIND=0.0.0.0:3030 INVOICE_DATA_DIR=/app/data INVOICE_DEMO=0
+COPY deploy/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh && mkdir /app/data && chown invoice:invoice /app/data
+# The entrypoint starts as root only to make a mounted volume writable, then runs the app as
+# the unprivileged `invoice` user. The platform's PORT variable (Railway sets it) chooses the
+# listening port; 3030 is the default elsewhere.
+ENV INVOICE_DATA_DIR=/app/data INVOICE_DEMO=0 PORT=3030
 EXPOSE 3030
 HEALTHCHECK --interval=30s --timeout=8s --start-period=15s --retries=3 CMD ["/app/invoice-tracker", "--healthcheck"]
-ENTRYPOINT ["/app/invoice-tracker"]
+ENTRYPOINT ["/app/entrypoint.sh"]

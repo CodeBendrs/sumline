@@ -20,6 +20,7 @@ const state = {
   store: "",
   mode: "login",
   mailEnabled: false,
+  signupCodeRequired: false,
   resetToken: null,
   policy: null,
   selected: null,
@@ -972,8 +973,30 @@ async function renderTeam() {
 }
 async function renderPrivacy() {
   $("page-content").innerHTML =
-    `<section class="card"><h3>Your documents and permissions</h3><ul class="privacy-summary"><li>Email connection is optional. PDF upload works without mailbox access.</li><li>Original invoices and extracted records are retained so authorized workspace members can access them.</li><li>Documents are processed without external AI services or advertising analytics.</li><li>You can correct fields, download PDFs and spreadsheets, delete invoices, and disconnect email.</li></ul><button class="secondary policy-link">Read the full privacy notice</button></section><section class="card"><h3>Your consent history</h3><div id="consent-history">Loading…</div></section>`;
+    `<section class="card"><h3>Your documents and permissions</h3><ul class="privacy-summary"><li>Email connection is optional. PDF upload works without mailbox access.</li><li>Original invoices and extracted records are retained so authorized workspace members can access them.</li><li>Documents are processed without external AI services or advertising analytics.</li><li>You can correct fields, download PDFs and spreadsheets, delete invoices, and disconnect email.</li></ul><p class="legal-links"><a href="/privacy" target="_blank" rel="noopener">Privacy policy</a> · <a href="/terms" target="_blank" rel="noopener">Terms of service</a></p></section><section class="card"><h3>Your consent history</h3><div id="consent-history">Loading…</div></section><section class="card danger-card"><h3>Delete your account</h3><p>This permanently deletes every workspace in which you are the only member, with its invoices, original PDFs, spreadsheets, stores, email connections and consent records. If you share a workspace you are removed from it. If you own a workspace that has other members, remove them under Team access first. Copies in backups expire on their own schedule, and you can also remove access in your Google or Microsoft account. This cannot be undone.</p><form id="delete-account-form"><label>Your password<input name="password" type="password" autocomplete="current-password" required></label><label>Type DELETE to confirm<input name="confirm" autocomplete="off" required pattern="DELETE" title="Type DELETE in capital letters"></label><p id="delete-error" class="error" role="alert"></p><button class="danger-button">Delete my account</button></form></section>`;
   bindPolicies();
+  $("delete-account-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const button = e.submitter;
+    button.disabled = true;
+    $("delete-error").textContent = "";
+    try {
+      const values = Object.fromEntries(new FormData(e.target));
+      await api("/api/auth/delete-account", {
+        method: "POST",
+        body: { password: values.password, confirm: values.confirm },
+      });
+      state.me = null;
+      $("app").hidden = true;
+      $("auth").hidden = false;
+      history.replaceState(null, "", "/");
+      authMode("login", "Your account and its data were deleted.");
+    } catch (err) {
+      $("delete-error").textContent = err.message;
+    } finally {
+      button.disabled = false;
+    }
+  };
   try {
     const data = await api("/api/consents");
     if (state.view !== "privacy") return;
@@ -992,16 +1015,8 @@ async function renderPrivacy() {
 async function openPolicy() {
   try {
     state.policy = state.policy || (await api("/api/privacy"));
-    const content = $("policy-content");
-    content.replaceChildren();
-    for (const paragraph of state.policy.notice.split("\n\n")) {
-      const heading = paragraph.match(/^(#{1,2})\s+(.*)$/);
-      const element = document.createElement(
-        heading ? (heading[1].length === 1 ? "h1" : "h2") : "p",
-      );
-      element.textContent = heading ? heading[2] : paragraph;
-      content.appendChild(element);
-    }
+    // The server escapes every character of the document before building this markup.
+    $("policy-content").innerHTML = state.policy.notice_html;
     $("policy-dialog").showModal();
   } catch (e) {
     toast(e.message);
@@ -1012,6 +1027,7 @@ function bindPolicies() {
     .querySelectorAll(".policy-link")
     .forEach((b) => (b.onclick = openPolicy));
 }
+const inviteToken = () => new URLSearchParams(location.search).get("invite");
 const authCopy = {
   login: ["Welcome back", "Sign in to your invoice records.", "Sign in"],
   register: [
@@ -1037,6 +1053,10 @@ function authMode(mode, notice = "") {
   const [title, subtitle, submit] = authCopy[mode];
   $("store-name-label").hidden = !register;
   $("account-consent-label").hidden = !register;
+  // An invitation link already proves the right to register, so the code is not asked for.
+  const needsCode = register && state.signupCodeRequired && !inviteToken();
+  $("signup-code-label").hidden = !needsCode;
+  $("signup-code").required = needsCode;
   $("email-label").hidden = mode === "reset";
   $("email").required = mode !== "reset";
   $("password-label").hidden = mode === "forgot";
@@ -1113,6 +1133,8 @@ $("auth-form").onsubmit = async (e) => {
           store_name: $("store-name").value,
           consent: $("account-consent").checked,
           policy_version: state.policy.version,
+          signup_code: $("signup-code").value,
+          invite: inviteToken(),
         },
       },
     );
@@ -1277,7 +1299,9 @@ async function start() {
   const reset = params.get("reset");
   if (verify || reset) history.replaceState(null, "", "/");
   try {
-    state.mailEnabled = (await api("/api/auth/options")).mail_enabled;
+    const options = await api("/api/auth/options");
+    state.mailEnabled = options.mail_enabled;
+    state.signupCodeRequired = options.signup_code_required;
   } catch {}
   if (reset) {
     state.resetToken = reset;

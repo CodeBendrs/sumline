@@ -27,6 +27,76 @@ pub fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// The 32-byte key that seals every document and provider token.
+///
+/// Sources, in this order of explicitness: `INVOICE_ENCRYPTION_KEY` (base64, kept in the host's
+/// secret variables, so it is not on the data disk), `INVOICE_ENCRYPTION_KEY_FILE` (a mounted
+/// file), or `encryption.key` in the data directory (created for local use only). Setting two
+/// explicit sources is refused. Nothing here ever puts key material in an error message.
+pub fn load_key(
+    env_key: Option<&str>,
+    key_file: Option<&Path>,
+    directory: &Path,
+    allow_generate: bool,
+) -> Result<Vec<u8>> {
+    let env_key = env_key.map(str::trim).filter(|v| !v.is_empty());
+    let checked = |key: Vec<u8>| {
+        if key.len() == 32 {
+            Ok(key)
+        } else {
+            Err(anyhow!("The encryption key must be exactly 32 bytes"))
+        }
+    };
+    match (env_key, key_file) {
+        (Some(_), Some(_)) => Err(anyhow!(
+            "Set only one of INVOICE_ENCRYPTION_KEY and INVOICE_ENCRYPTION_KEY_FILE"
+        )),
+        (Some(text), None) => {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .or_else(|_| URL_SAFE_NO_PAD.decode(text.trim_end_matches('=')))
+                .map_err(|_| anyhow!("INVOICE_ENCRYPTION_KEY is not valid base64"))?;
+            checked(decoded)
+        }
+        (None, Some(path)) => {
+            if !path.is_file() {
+                return Err(anyhow!("Configured encryption key is missing"));
+            }
+            checked(std::fs::read(path)?)
+        }
+        (None, None) => {
+            let path = directory.join("encryption.key");
+            if path.exists() {
+                return checked(std::fs::read(&path)?);
+            }
+            if !allow_generate {
+                return Err(anyhow!(
+                    "No encryption key is configured. Set INVOICE_ENCRYPTION_KEY (create one with `invoice-tracker --generate-key`)"
+                ));
+            }
+            let mut key = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut key);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            use std::io::Write;
+            options.open(&path)?.write_all(&key)?;
+            Ok(key.to_vec())
+        }
+    }
+}
+
+/// A fresh random key in the form `INVOICE_ENCRYPTION_KEY` expects.
+pub fn generate_key() -> String {
+    let mut key = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut key);
+    base64::engine::general_purpose::STANDARD.encode(key)
+}
+
 /// Email verification state and single-use verification/reset tokens.
 fn migrate_accounts(db: &Connection) -> Result<()> {
     let columns: Vec<String> = db
@@ -87,6 +157,53 @@ pub fn unseal_with_key(key: &[u8], account: &str, bytes: &[u8]) -> Result<Vec<u8
     unseal_with_cipher(&cipher, account, bytes)
 }
 
+/// Test helper result, so a test reads `exists.not()` instead of a bare boolean.
+#[cfg(test)]
+pub struct Exists(bool);
+#[cfg(test)]
+impl Exists {
+    pub fn not(&self) -> bool {
+        !self.0
+    }
+}
+
+/// What deleting an account did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Deletion {
+    Done,
+    /// The person owns a workspace that still has other members, so nothing was changed.
+    BlockedByMembers,
+}
+
+/// Removes a workspace and everything in it, children before parents (foreign keys are on).
+/// Deleting invoices fires triggers that touch the version and cache tables, so those are
+/// cleared afterwards.
+fn delete_workspace(tx: &rusqlite::Transaction<'_>, workspace: &str) -> Result<()> {
+    for sql in [
+        "DELETE FROM invoices WHERE account=?1",
+        "DELETE FROM invoice_jobs WHERE account=?1",
+        "DELETE FROM invoice_intents WHERE account=?1",
+        "DELETE FROM query_cache WHERE account=?1",
+        "DELETE FROM export_cache WHERE account=?1",
+        "DELETE FROM exports WHERE account=?1",
+        "DELETE FROM workspace_versions WHERE account=?1",
+        "DELETE FROM processed_messages WHERE account=?1",
+        "DELETE FROM oauth_states WHERE account=?1",
+        "DELETE FROM connectors WHERE account=?1",
+        "DELETE FROM events WHERE account=?1",
+        "DELETE FROM consents WHERE workspace=?1",
+        "DELETE FROM invitations WHERE workspace=?1",
+        "DELETE FROM supplier_profiles WHERE workspace=?1",
+        "DELETE FROM sessions WHERE workspace=?1",
+        "DELETE FROM stores WHERE workspace=?1",
+        "DELETE FROM memberships WHERE workspace=?1",
+        "DELETE FROM workspaces WHERE id=?1",
+    ] {
+        tx.execute(sql, [workspace])?;
+    }
+    Ok(())
+}
+
 /// Minimum seconds between two emails of the same kind for one account.
 pub const EMAIL_TOKEN_COOLDOWN_SECONDS: i64 = 60;
 
@@ -97,38 +214,29 @@ pub struct Store {
 }
 
 impl Store {
+    /// Opens (creating if needed) the store, generating a key file when none exists. For local
+    /// development and tests; deployments use [`Store::open_with`].
     pub fn open(directory: &Path) -> Result<Self> {
+        Self::open_with(directory, true)
+    }
+    /// With `allow_generate` false, a missing key is an error instead of a new key file written
+    /// beside the database, so a public deployment can never silently mint a key that sits on
+    /// the same disk as the data it protects.
+    pub fn open_with(directory: &Path, allow_generate: bool) -> Result<Self> {
         std::fs::create_dir_all(directory)?;
-        let external_key = std::env::var_os("INVOICE_ENCRYPTION_KEY_FILE");
-        let key_path = external_key
-            .as_ref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| directory.join("encryption.key"));
-        if external_key.is_some() && !key_path.is_file() {
-            return Err(anyhow!("Configured encryption key is missing"));
-        }
-        let key = if key_path.exists() {
-            std::fs::read(&key_path)?
-        } else {
-            let mut key = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut key);
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            use std::io::Write;
-            options.open(&key_path)?.write_all(&key)?;
-            key.to_vec()
-        };
-        if key.len() != 32 {
-            return Err(anyhow!("Invalid encryption key"));
-        }
+        let env_key = std::env::var("INVOICE_ENCRYPTION_KEY").ok();
+        let key_file = std::env::var_os("INVOICE_ENCRYPTION_KEY_FILE")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from);
+        let key = load_key(
+            env_key.as_deref(),
+            key_file.as_deref(),
+            directory,
+            allow_generate,
+        )?;
         let db = Connection::open(directory.join("invoice-tracker.sqlite"))?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
-        db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;
+        db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA secure_delete=ON;
             CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL, store_name TEXT NOT NULL, created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS memberships (workspace TEXT NOT NULL REFERENCES workspaces(id), user TEXT NOT NULL REFERENCES accounts(id), role TEXT NOT NULL CHECK(role IN ('owner','member')), PRIMARY KEY(workspace,user));
@@ -329,6 +437,67 @@ impl Store {
             .query_map([workspace], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<_, _>>()?;
         Ok(rows)
+    }
+    /// Permanently deletes a person's account and what only they could see.
+    ///
+    /// Every workspace in which they are the sole member is deleted with all its invoices,
+    /// documents, stores, email connections (and their stored tokens), caches and history.
+    /// Workspaces they share are left, not deleted. An owner of a workspace that still has other
+    /// members is refused, because nobody could then administer it; nothing is changed. It all
+    /// happens in one transaction.
+    pub fn delete_account(&self, user: &str) -> Result<Deletion> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let owned: Vec<String> = tx
+            .prepare("SELECT workspace FROM memberships WHERE user=?1 AND role='owner'")?
+            .query_map([user], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        for workspace in &owned {
+            let others: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM memberships WHERE workspace=?1 AND user!=?2",
+                params![workspace, user],
+                |r| r.get(0),
+            )?;
+            if others > 0 {
+                return Ok(Deletion::BlockedByMembers);
+            }
+        }
+        for workspace in &owned {
+            delete_workspace(&tx, workspace)?;
+        }
+        for sql in [
+            "DELETE FROM sessions WHERE account=?1",
+            "DELETE FROM invitations WHERE created_by=?1",
+            "DELETE FROM consents WHERE user=?1",
+            "DELETE FROM email_tokens WHERE account=?1",
+            "DELETE FROM memberships WHERE user=?1",
+            "DELETE FROM accounts WHERE id=?1",
+        ] {
+            tx.execute(sql, [user])?;
+        }
+        tx.commit()?;
+        Ok(Deletion::Done)
+    }
+    /// Test helper: whether any invoice record with this id exists in any workspace.
+    #[cfg(test)]
+    pub fn record_exists_anywhere(&self, id: &str) -> Result<Exists> {
+        Ok(Exists(self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM invoices WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?))
+    }
+    /// Whether `token` is an unexpired invitation written for exactly this address.
+    pub fn invitation_is_for(&self, token: &str, email: &str) -> Result<bool> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM invitations WHERE hash=?1 AND email=?2 AND expires>?3)",
+            params![
+                hash(token.as_bytes()),
+                email.to_lowercase().trim(),
+                chrono::Utc::now().timestamp()
+            ],
+            |r| r.get(0),
+        )?)
     }
     pub fn account_by_email(&self, email: &str) -> Result<Option<(String, String)>> {
         Ok(self
@@ -616,7 +785,7 @@ impl Store {
     pub fn consent(&self, user: &str, workspace: &str, kind: &str) -> Result<()> {
         self.db.lock().unwrap().execute(
             "INSERT INTO consents(user,workspace,kind,version,granted_at) VALUES (?1,?2,?3,?4,?5)",
-            params![user, workspace, kind, crate::privacy::POLICY_VERSION, now()],
+            params![user, workspace, kind, crate::legal::POLICY_VERSION, now()],
         )?;
         Ok(())
     }
@@ -668,6 +837,272 @@ mod tests {
         assert_eq!(store.unseal(&a, &sealed).unwrap(), b"private invoice");
         assert!(store.login("a@example.com", "wrong").unwrap().is_none());
     }
+    /// Counts rows in every table and column that hold any of `needles` as text.
+    fn references(db: &Connection, needles: &[&str]) -> Vec<String> {
+        let tables: Vec<String> = db
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let mut found = Vec::new();
+        for table in tables {
+            let columns: Vec<String> = db
+                .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+                .unwrap()
+                .query_map([], |r| r.get(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            for column in columns {
+                for needle in needles {
+                    let count: i64 = db
+                        .query_row(
+                            &format!("SELECT COUNT(*) FROM \"{table}\" WHERE CAST(\"{column}\" AS TEXT)=?1"),
+                            [needle],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    if count > 0 {
+                        found.push(format!("{table}.{column} still has {needle}"));
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn deleting_an_account_removes_every_trace_of_what_only_they_owned() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let leaver = store
+            .register(
+                "leaver@example.test",
+                "correct horse battery staple",
+                "Leaver Shop",
+            )
+            .unwrap();
+        let keeper = store
+            .register(
+                "keeper@example.test",
+                "correct horse battery staple",
+                "Keeper Shop",
+            )
+            .unwrap();
+        let (leaver_ws, keeper_ws) = (
+            store.workspace_for_user(&leaver).unwrap(),
+            store.workspace_for_user(&keeper).unwrap(),
+        );
+        // Give the leaver data in every kind of table.
+        store
+            .insert_document(&leaver_ws, "a.pdf", b"%PDF-leaver", "Upload", None, None)
+            .unwrap();
+        store
+            .insert_document(&keeper_ws, "b.pdf", b"%PDF-keeper", "Upload", None, None)
+            .unwrap();
+        store
+            .remember_supplier(
+                &leaver_ws,
+                &["tax:123456789RT0001".into()],
+                "Leaver Supplier Ltd",
+            )
+            .unwrap();
+        store
+            .consent(&leaver, &leaver_ws, "account_processing")
+            .unwrap();
+        store.event(&leaver_ws, "sync", "Inbox checked.").unwrap();
+        store
+            .issue_email_token(&leaver, "verify", "leaver@example.test", 3600)
+            .unwrap();
+        let (_session, _csrf) = store.add_session(&leaver).unwrap();
+        {
+            let db = store.db.lock().unwrap();
+            db.execute("INSERT INTO connectors(account,provider,email,tokens) VALUES (?1,'google','leaver-gmail@example.test',x'00')", [&leaver_ws]).unwrap();
+            db.execute(
+                "INSERT INTO processed_messages VALUES (?1,'google','message-1')",
+                [&leaver_ws],
+            )
+            .unwrap();
+            db.execute("INSERT INTO oauth_states VALUES ('state-hash',?1,'session-hash','google',x'00',9999999999)", [&leaver_ws]).unwrap();
+            db.execute("INSERT INTO exports VALUES (?1,x'00','now')", [&leaver_ws])
+                .unwrap();
+            db.execute("INSERT INTO invitations VALUES ('invite-hash',?1,?2,'invitee@example.test',9999999999)", params![leaver_ws, leaver]).unwrap();
+        }
+
+        assert_eq!(store.delete_account(&leaver).unwrap(), Deletion::Done);
+        let db = store.db.lock().unwrap();
+        let left = references(
+            &db,
+            &[
+                &leaver_ws,
+                &leaver,
+                "leaver@example.test",
+                "leaver-gmail@example.test",
+                "invitee@example.test",
+                "Leaver Supplier Ltd",
+            ],
+        );
+        assert!(left.is_empty(), "traces remain: {left:?}");
+        // The other person is untouched.
+        let still: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM invoices WHERE account=?1",
+                [&keeper_ws],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still, 1);
+        assert!(!references(&db, &[&keeper_ws, &keeper, "keeper@example.test"]).is_empty());
+    }
+
+    #[test]
+    fn a_member_leaves_a_shared_workspace_and_an_owner_with_members_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let owner = store
+            .register(
+                "owner@example.test",
+                "correct horse battery staple",
+                "Shared Shop",
+            )
+            .unwrap();
+        let member = store
+            .register(
+                "member@example.test",
+                "correct horse battery staple",
+                "Member Own Shop",
+            )
+            .unwrap();
+        let shared = store.workspace_for_user(&owner).unwrap();
+        let member_own = store.workspace_for_user(&member).unwrap();
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO memberships VALUES (?1,?2,'member')",
+                params![shared, member],
+            )
+            .unwrap();
+        store
+            .insert_document(&shared, "shared.pdf", b"%PDF-shared", "Upload", None, None)
+            .unwrap();
+
+        // The owner cannot delete while someone else still belongs to the workspace.
+        assert_eq!(
+            store.delete_account(&owner).unwrap(),
+            Deletion::BlockedByMembers
+        );
+        assert!(
+            store
+                .account_by_email("owner@example.test")
+                .unwrap()
+                .is_some(),
+            "nothing was changed"
+        );
+        assert_eq!(store.records(&shared).unwrap().len(), 1);
+
+        // The member can: their own workspace goes, the shared one stays intact.
+        assert_eq!(store.delete_account(&member).unwrap(), Deletion::Done);
+        assert!(
+            store
+                .account_by_email("member@example.test")
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.records(&member_own).unwrap().is_empty());
+        assert_eq!(store.records(&shared).unwrap().len(), 1);
+        // With the member gone, the owner is now the only member and may delete everything.
+        assert_eq!(store.delete_account(&owner).unwrap(), Deletion::Done);
+        assert!(store.records(&shared).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_encryption_key_comes_from_one_explicit_source_and_is_never_echoed() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = generate_key();
+        // Environment variable: standard or URL-safe base64, surrounding space ignored.
+        let from_env =
+            load_key(Some(&format!("  {key}\n")), None, directory.path(), false).unwrap();
+        assert_eq!(from_env.len(), 32);
+        let url_safe = key
+            .replace('+', "-")
+            .replace('/', "_")
+            .trim_end_matches('=')
+            .to_string();
+        assert_eq!(
+            load_key(Some(&url_safe), None, directory.path(), false).unwrap(),
+            from_env
+        );
+        assert!(
+            !directory.path().join("encryption.key").exists(),
+            "nothing is written to the data disk"
+        );
+        // Wrong length, not base64, or two sources at once: refused, without printing the secret.
+        let short = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
+        for bad in [short.as_str(), "!!!not base64!!!"] {
+            let error = format!(
+                "{:#}",
+                load_key(Some(bad), None, directory.path(), false).unwrap_err()
+            );
+            assert!(!error.contains(bad), "{error}");
+        }
+        let file = directory.path().join("explicit.key");
+        std::fs::write(&file, [9u8; 32]).unwrap();
+        assert!(load_key(Some(&key), Some(&file), directory.path(), false).is_err());
+        // A key file: must exist and be 32 bytes.
+        assert_eq!(
+            load_key(None, Some(&file), directory.path(), false).unwrap(),
+            vec![9u8; 32]
+        );
+        assert!(
+            load_key(
+                None,
+                Some(&directory.path().join("missing.key")),
+                directory.path(),
+                false
+            )
+            .is_err()
+        );
+        std::fs::write(&file, [9u8; 5]).unwrap();
+        assert!(load_key(None, Some(&file), directory.path(), false).is_err());
+    }
+
+    #[test]
+    fn a_key_is_generated_beside_the_data_only_when_allowed() {
+        let directory = tempfile::tempdir().unwrap();
+        // A public deployment without a configured key must fail, not mint one on the data disk.
+        let error = format!(
+            "{:#}",
+            load_key(None, None, directory.path(), false).unwrap_err()
+        );
+        assert!(error.contains("INVOICE_ENCRYPTION_KEY"), "{error}");
+        assert!(!directory.path().join("encryption.key").exists());
+        // Local use generates once, privately, and then keeps using the same key.
+        let first = load_key(None, None, directory.path(), true).unwrap();
+        assert_eq!(first.len(), 32);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(directory.path().join("encryption.key"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(load_key(None, None, directory.path(), true).unwrap(), first);
+        // An existing key file is still honoured on a public deployment (a migrated data disk).
+        assert_eq!(
+            load_key(None, None, directory.path(), false).unwrap(),
+            first
+        );
+        assert_ne!(generate_key(), generate_key());
+    }
+
     #[test]
     fn remembered_suppliers_are_per_workspace_and_the_latest_confirmation_wins() {
         let directory = tempfile::tempdir().unwrap();

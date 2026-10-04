@@ -193,14 +193,22 @@
               hidden
             >
               Forgot your password?</button
+            ><label id="signup-code-label" hidden
+              >Invitation code<input
+                id="signup-code"
+                autocomplete="off"
+                maxlength="128" /></label
             ><label id="account-consent-label" class="check-label" hidden
               ><input id="account-consent" type="checkbox" /><span
                 >I have read the
-                <button class="text-link policy-link" type="button">
-                  privacy notice
-                </button>
-                and agree to invoice processing and storage for my
-                workspace.</span
+                <a href="/privacy" target="_blank" rel="noopener"
+                  >Privacy Policy</a
+                >
+                and
+                <a href="/terms" target="_blank" rel="noopener"
+                  >Terms of Service</a
+                >, and I agree that {{PRODUCT_NAME}} may process the invoices I
+                provide for my workspace.</span
               ></label
             >
             <p id="auth-notice" class="auth-notice" role="status" hidden></p>
@@ -221,9 +229,11 @@
               Open sample workspace
             </button>
           </div>
-          <button class="text-link policy-link footer-link">
-            Privacy notice
-          </button>
+          <p class="footer-link legal-links">
+            <a href="/privacy" target="_blank" rel="noopener">Privacy policy</a>
+            ·
+            <a href="/terms" target="_blank" rel="noopener">Terms of service</a>
+          </p>
         </div>
       </section>
     </main>
@@ -469,7 +479,13 @@
         <div id="page-content"></div>
         <footer class="main-footer">
           <span>{{PRODUCT_NAME}}</span
-          ><button class="text-link policy-link">Privacy notice</button>
+          ><span class="legal-links"
+            ><a href="/privacy" target="_blank" rel="noopener">Privacy policy</a>
+            ·
+            <a href="/terms" target="_blank" rel="noopener"
+              >Terms of service</a
+            ></span
+          >
         </footer>
       </main>
     </div>
@@ -507,11 +523,11 @@
     ></dialog>
     <dialog id="policy-dialog">
       <div class="dialog-heading">
-        <h2>Privacy notice</h2>
+        <h2>Privacy policy</h2>
         <button
           id="close-policy"
           class="icon-button"
-          aria-label="Close privacy notice"
+          aria-label="Close privacy policy"
         >
           ×
         </button>

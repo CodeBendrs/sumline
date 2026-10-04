@@ -5,16 +5,17 @@ mod catalog;
 mod extraction;
 mod items;
 mod layout;
+mod legal;
 mod mail;
 mod model;
 mod outbound;
-mod privacy;
 mod reliability;
 mod spreadsheet;
 mod storage;
 mod supplier;
 #[cfg(test)]
 mod testkit;
+mod trust;
 mod worker;
 
 use anyhow::{Result, anyhow};
@@ -41,8 +42,12 @@ pub struct Config {
     origin: String,
     demo: bool,
     samples: Option<PathBuf>,
-    /// Peers whose `X-Forwarded-For` header is believed (a reverse proxy we run ourselves).
-    trusted_proxies: Vec<std::net::IpAddr>,
+    /// Address ranges of reverse proxies we run, whose `X-Forwarded-For` header is believed.
+    trusted_proxies: Vec<trust::Cidr>,
+    /// When set, registering needs this code (or an invitation to the registering address).
+    signup_code: Option<String>,
+    /// Who runs this deployment, as named in the privacy policy and terms.
+    operator: legal::Operator,
     /// Mailbox API roots. Always the real providers outside tests, which point them at a fake.
     gmail_api: String,
     graph_api: String,
@@ -136,16 +141,32 @@ struct Context {
     role: String,
     session: String,
 }
-fn cookie(headers: &HeaderMap) -> Option<String> {
+/// Over HTTPS the session cookie is `__Host-` prefixed: browsers only accept such a cookie when
+/// it is Secure, has Path=/ and no Domain, and refuse to let another host set it. That matters
+/// on a shared parent domain, where a sibling subdomain could otherwise plant a session cookie
+/// for this site. Only the cookie that matches the deployment is accepted, never the other.
+fn session_cookie_name(https: bool) -> &'static str {
+    if https {
+        "__Host-it_session"
+    } else {
+        "it_session"
+    }
+}
+fn cookie(headers: &HeaderMap, https: bool) -> Option<String> {
+    let prefix = format!("{}=", session_cookie_name(https));
     headers
         .get(header::COOKIE)?
         .to_str()
         .ok()?
         .split(';')
-        .find_map(|item| item.trim().strip_prefix("it_session=").map(str::to_string))
+        .find_map(|item| {
+            item.trim()
+                .strip_prefix(prefix.as_str())
+                .map(str::to_string)
+        })
 }
 fn auth(app: &App, headers: &HeaderMap) -> ApiResult<Context> {
-    let session = cookie(headers)
+    let session = cookie(headers, app.config.origin.starts_with("https:"))
         .ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "Sign in to continue.".into()))?;
     let (user, workspace, csrf, role) = app.store.session(&session)?.ok_or_else(|| {
         ApiError(
@@ -185,15 +206,15 @@ fn owner(context: &Context) -> ApiResult<()> {
 }
 fn login_response(app: &App, user: &str) -> ApiResult<Response> {
     let (session, csrf) = app.store.add_session(user)?;
-    let secure = if app.config.origin.starts_with("https:") {
-        "; Secure"
-    } else {
-        ""
-    };
+    let https = app.config.origin.starts_with("https:");
+    let secure = if https { "; Secure" } else { "" };
     Ok((
         [(
             header::SET_COOKIE,
-            format!("it_session={session}; HttpOnly; SameSite=Lax; Path=/; Max-Age=43200{secure}"),
+            format!(
+                "{}={session}; HttpOnly; SameSite=Lax; Path=/; Max-Age=43200{secure}",
+                session_cookie_name(https)
+            ),
         )],
         Json(json!({"csrf":csrf})),
     )
@@ -202,21 +223,28 @@ fn login_response(app: &App, user: &str) -> ApiResult<Response> {
 
 /// The address rate limits are counted against. Behind a reverse proxy every connection comes
 /// from the proxy, so the forwarded client address is used, but only when the connection really
-/// is from a configured proxy: anyone else could send that header themselves.
+/// is from a proxy we trust: anyone else could send that header themselves. The header is read
+/// from the right, skipping our own proxies' addresses; the first address that is not one of
+/// ours is the visitor. That is correct whether the proxy appends to the header (Caddy, with
+/// the address set as in deploy/Caddyfile.example) or adds several internal hops after the
+/// real client (Railway), and anything a visitor wrote further left is never reached.
 fn client_key(
-    trusted: &[std::net::IpAddr],
+    trusted: &[trust::Cidr],
     peer: Option<std::net::IpAddr>,
     forwarded: Option<&str>,
 ) -> String {
     let Some(peer) = peer else {
         return "local-test".into();
     };
-    if trusted.contains(&peer)
-        && let Some(client) = forwarded
-            .and_then(|v| v.rsplit(',').next())
-            .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok())
+    let ours = |ip: std::net::IpAddr| trusted.iter().any(|range| range.contains(ip));
+    if ours(peer)
+        && let Some(visitor) = forwarded
+            .into_iter()
+            .flat_map(|v| v.rsplit(','))
+            .filter_map(|v| v.trim().parse::<std::net::IpAddr>().ok())
+            .find(|ip| !ours(*ip))
     {
-        return client.to_string();
+        return visitor.to_string();
     }
     peer.to_string()
 }
@@ -296,10 +324,40 @@ struct Credentials {
     store_name: Option<String>,
     consent: Option<bool>,
     policy_version: Option<String>,
+    signup_code: Option<String>,
+    invite: Option<String>,
+}
+/// Compares two secrets without stopping at the first difference.
+fn same_secret(a: &str, b: &str) -> bool {
+    let (a, b) = (hash(a.as_bytes()), hash(b.as_bytes()));
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |diff, (x, y)| diff | (x ^ y))
+        == 0
 }
 async fn register(State(app): State<App>, Json(body): Json<Credentials>) -> ApiResult<Response> {
-    if body.consent != Some(true) || body.policy_version.as_deref() != Some(privacy::POLICY_VERSION)
-    {
+    if let Some(expected) = &app.config.signup_code {
+        let code_ok = body
+            .signup_code
+            .as_deref()
+            .is_some_and(|code| same_secret(code.trim(), expected));
+        // Someone a workspace owner invited may register without the code, but only at the
+        // address the invitation was written for.
+        let invited = !code_ok
+            && body.invite.as_deref().is_some_and(|token| {
+                app.store
+                    .invitation_is_for(token, &body.email)
+                    .unwrap_or(false)
+            });
+        if !code_ok && !invited {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                "Registration is by invitation during the pilot. Ask for an invitation code."
+                    .into(),
+            ));
+        }
+    }
+    if body.consent != Some(true) || body.policy_version.as_deref() != Some(legal::POLICY_VERSION) {
         return Err(bad(
             "Read and accept the current privacy notice before creating an account.",
         ));
@@ -328,6 +386,7 @@ async fn register(State(app): State<App>, Json(body): Json<Credentials>) -> ApiR
         })?;
     let workspace = app.store.workspace_for_user(&user)?;
     app.store.consent(&user, &workspace, "account_processing")?;
+    app.store.consent(&user, &workspace, "terms_of_service")?;
     let verification = app.clone();
     let address = body.email.trim().to_lowercase();
     let account = user.clone();
@@ -366,20 +425,73 @@ async fn healthz(State(app): State<App>) -> Response {
         (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"ok":false}))).into_response()
     }
 }
+#[derive(Deserialize)]
+struct DeleteAccount {
+    password: String,
+    confirm: String,
+}
+/// Permanently deletes the signed-in person's account (see `Store::delete_account`). It asks
+/// for the password again and a typed confirmation, so a stolen session or a stray click cannot
+/// do it. It sits under /api/auth/ so the sign-in rate limit and origin check apply.
+async fn delete_account(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<DeleteAccount>,
+) -> ApiResult<Response> {
+    let context = mutation(&app, &headers)?;
+    if body.confirm.trim() != "DELETE" {
+        return Err(bad("Type DELETE to confirm."));
+    }
+    let email = app.store.account(&context.user)?["email"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let store = app.store.clone();
+    let password = body.password;
+    let verified = tokio::task::spawn_blocking(move || store.login(&email, &password))
+        .await
+        .map_err(|_| bad("The account could not be deleted."))??;
+    if verified.as_deref() != Some(context.user.as_str()) {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "That password is not correct.".into(),
+        ));
+    }
+    let store = app.store.clone();
+    let user = context.user.clone();
+    match tokio::task::spawn_blocking(move || store.delete_account(&user))
+        .await
+        .map_err(|_| bad("The account could not be deleted."))??
+    {
+        storage::Deletion::BlockedByMembers => Err(ApiError(
+            StatusCode::CONFLICT,
+            "Your workspace still has other members. Remove them under Team access first, then delete your account."
+                .into(),
+        )),
+        storage::Deletion::Done => {
+            Ok((cleared_session(&app), Json(json!({"ok":true}))).into_response())
+        }
+    }
+}
+/// Expires the session cookie in the browser.
+fn cleared_session(app: &App) -> [(header::HeaderName, String); 1] {
+    let https = app.config.origin.starts_with("https:");
+    let secure = if https { "; Secure" } else { "" };
+    [(
+        header::SET_COOKIE,
+        format!(
+            "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure}",
+            session_cookie_name(https)
+        ),
+    )]
+}
 async fn logout(State(app): State<App>, headers: HeaderMap) -> ApiResult<Response> {
     let context = mutation(&app, &headers)?;
     app.store.db.lock().unwrap().execute(
         "DELETE FROM sessions WHERE hash=?1",
         [hash(context.session.as_bytes())],
     )?;
-    Ok((
-        [(
-            header::SET_COOKIE,
-            "it_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
-        )],
-        Json(json!({"ok":true})),
-    )
-        .into_response())
+    Ok((cleared_session(&app), Json(json!({"ok":true}))).into_response())
 }
 fn sample_workspace(app: &App, workspace: &str) -> Result<bool> {
     Ok(app.store.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM memberships m JOIN accounts a ON a.id=m.user WHERE m.workspace=?1 AND m.role='owner' AND a.email='preview@invoice-tracker.local')",[workspace],|r|r.get(0))?)
@@ -393,7 +505,7 @@ async fn me(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>
         stmt.query_map([&context.user],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?})))?.collect::<std::result::Result<Vec<_>,_>>()?
     };
     Ok(Json(
-        json!({"user":user,"workspace":context.workspace,"workspaces":workspaces,"role":context.role,"csrf":context.csrf,"stores":app.store.stores(&context.workspace)?,"demo":app.config.demo,"is_sample":sample_workspace(&app,&context.workspace)?,"initial_lookback_days":mail::lookback_days(),"policy_version":privacy::POLICY_VERSION,"mail_enabled":app.mailer.enabled(),"currencies":model::SUPPORTED_CURRENCIES}),
+        json!({"user":user,"workspace":context.workspace,"workspaces":workspaces,"role":context.role,"csrf":context.csrf,"stores":app.store.stores(&context.workspace)?,"demo":app.config.demo,"is_sample":sample_workspace(&app,&context.workspace)?,"initial_lookback_days":mail::lookback_days(),"policy_version":legal::POLICY_VERSION,"mail_enabled":app.mailer.enabled(),"currencies":model::SUPPORTED_CURRENCIES}),
     ))
 }
 async fn demo(State(app): State<App>) -> ApiResult<Response> {
@@ -921,7 +1033,7 @@ async fn connect(
 ) -> ApiResult<Json<Value>> {
     let c = mutation(&app, &headers)?;
     owner(&c)?;
-    if !body.consent || body.policy_version != privacy::POLICY_VERSION {
+    if !body.consent || body.policy_version != legal::POLICY_VERSION {
         return Err(bad("Review and consent to email processing first."));
     }
     if sample_workspace(&app, &c.workspace)? {
@@ -1168,33 +1280,227 @@ async fn consent_history(State(app): State<App>, headers: HeaderMap) -> ApiResul
     let mut stmt=db.prepare("SELECT kind,version,granted_at,withdrawn_at FROM consents WHERE user=?1 AND workspace=?2 ORDER BY id DESC")?;
     let rows=stmt.query_map(params![c.user,c.workspace],|r|Ok(json!({"kind":r.get::<_,String>(0)?,"version":r.get::<_,String>(1)?,"granted_at":r.get::<_,String>(2)?,"withdrawn_at":r.get::<_,Option<String>>(3)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
     Ok(Json(
-        json!({"consents":rows,"policy_version":privacy::POLICY_VERSION}),
+        json!({"consents":rows,"policy_version":legal::POLICY_VERSION}),
+    ))
+}
+
+/// The documents with this deployment's operator details filled in, for the in-app viewer.
+async fn privacy_info(State(app): State<App>) -> Json<Value> {
+    let origin = &app.config.origin;
+    Json(json!({
+        "version": legal::POLICY_VERSION,
+        "notice": legal::privacy_text(&app.config.operator, origin, app.mailer.provider()),
+        "notice_html": legal::to_html(&legal::privacy_text(&app.config.operator, origin, app.mailer.provider())),
+        "terms": legal::terms_text(&app.config.operator, origin),
+        "terms_html": legal::to_html(&legal::terms_text(&app.config.operator, origin)),
+        "demo": app.config.demo,
+    }))
+}
+/// Public pages: Google's consent screen and anyone considering signing up can read them
+/// without an account.
+async fn privacy_page(State(app): State<App>) -> Html<String> {
+    Html(legal::page(
+        "Privacy policy",
+        &legal::privacy_text(
+            &app.config.operator,
+            &app.config.origin,
+            app.mailer.provider(),
+        ),
+    ))
+}
+async fn terms_page(State(app): State<App>) -> Html<String> {
+    Html(legal::page(
+        "Terms of service",
+        &legal::terms_text(&app.config.operator, &app.config.origin),
     ))
 }
 
 fn router(app: App) -> Router {
     Router::new()
-        .route("/",get(||async {Html(branding::index())}))
-        .route("/app.js",get(||async {([(header::CONTENT_TYPE,"text/javascript")],include_str!("../web/app.js"))}))
-        .route("/style.css",get(||async {([(header::CONTENT_TYPE,"text/css")],include_str!("../web/style.css"))}))
-        .route("/tokens.css",get(||async {([(header::CONTENT_TYPE,"text/css")],include_str!("../web/tokens.css"))}))
-        .route("/favicon.svg",get(||async {([(header::CONTENT_TYPE,"image/svg+xml")],include_str!("../web/favicon.svg"))}))
-        .route("/fonts/archivo.woff2",get(||async {([(header::CONTENT_TYPE,"font/woff2")],include_bytes!("../web/fonts/archivo.woff2").as_slice())}))
-        .route("/fonts/atkinson-next.woff2",get(||async {([(header::CONTENT_TYPE,"font/woff2")],include_bytes!("../web/fonts/atkinson-next.woff2").as_slice())}))
-        .route("/fonts/atkinson-mono.woff2",get(||async {([(header::CONTENT_TYPE,"font/woff2")],include_bytes!("../web/fonts/atkinson-mono.woff2").as_slice())}))
-        .route("/api/privacy",get(|State(app):State<App>|async move {Json(json!({"version":privacy::POLICY_VERSION,"notice":privacy::NOTICE.replace("{{PRODUCT_NAME}}",branding::NAME),"demo":app.config.demo}))}))
-        .route("/api/auth/register",post(register)).route("/api/auth/login",post(login)).route("/api/auth/demo",post(demo)).route("/api/auth/logout",post(logout))
-        .route("/healthz",get(healthz))
-        .route("/api/auth/options",get(accounts::options)).route("/api/auth/verify",post(accounts::verify)).route("/api/auth/resend-verification",post(accounts::resend_verification)).route("/api/auth/forgot",post(accounts::forgot)).route("/api/auth/reset",post(accounts::reset))
-        .route("/api/me",get(me)).route("/api/invoices",get(records)).route("/api/upload",post(upload))
-        .route("/api/invoices/{id}",get(invoice)).route("/api/invoices/reread",post(reread_review)).route("/api/invoices/{id}/approve",post(approve)).route("/api/invoices/{id}/exclude",post(exclude)).route("/api/invoices/{id}/delete",post(delete_invoice)).route("/api/invoices/{id}/document",get(document))
-        .route("/api/export",get(export)).route("/api/stores",post(add_store)).route("/api/stores/{id}",post(update_store))
-        .route("/api/connections",get(connections)).route("/api/connections/{provider}/start",post(connect)).route("/api/connections/{provider}/disconnect",post(disconnect)).route("/api/sync",post(sync))
-        .route("/api/oauth/{provider}/callback",get(callback)).route("/api/activity",get(activity))
-        .route("/api/invitations",post(invite)).route("/api/invitations/accept",post(accept_invite)).route("/api/workspaces/{id}/select",post(switch_workspace)).route("/api/consents",get(consent_history))
-        .route("/api/members",get(members)).route("/api/members/{id}/remove",post(remove_member))
-        .layer(DefaultBodyLimit::max(25*1024*1024))
-        .layer(middleware::from_fn_with_state(app.clone(),security)).with_state(app)
+        .route("/", get(|| async { Html(branding::index()) }))
+        .route(
+            "/app.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript")],
+                    include_str!("../web/app.js"),
+                )
+            }),
+        )
+        .route(
+            "/style.css",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/css")],
+                    include_str!("../web/style.css"),
+                )
+            }),
+        )
+        .route(
+            "/tokens.css",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/css")],
+                    include_str!("../web/tokens.css"),
+                )
+            }),
+        )
+        .route(
+            "/favicon.svg",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "image/svg+xml")],
+                    include_str!("../web/favicon.svg"),
+                )
+            }),
+        )
+        .route(
+            "/fonts/archivo.woff2",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "font/woff2")],
+                    include_bytes!("../web/fonts/archivo.woff2").as_slice(),
+                )
+            }),
+        )
+        .route(
+            "/fonts/atkinson-next.woff2",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "font/woff2")],
+                    include_bytes!("../web/fonts/atkinson-next.woff2").as_slice(),
+                )
+            }),
+        )
+        .route(
+            "/fonts/atkinson-mono.woff2",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "font/woff2")],
+                    include_bytes!("../web/fonts/atkinson-mono.woff2").as_slice(),
+                )
+            }),
+        )
+        .route("/api/privacy", get(privacy_info))
+        .route("/privacy", get(privacy_page))
+        .route("/terms", get(terms_page))
+        .route("/api/auth/register", post(register))
+        .route("/api/auth/login", post(login))
+        .route("/api/auth/demo", post(demo))
+        .route("/api/auth/logout", post(logout))
+        .route("/api/auth/delete-account", post(delete_account))
+        .route("/healthz", get(healthz))
+        .route("/api/auth/options", get(accounts::options))
+        .route("/api/auth/verify", post(accounts::verify))
+        .route(
+            "/api/auth/resend-verification",
+            post(accounts::resend_verification),
+        )
+        .route("/api/auth/forgot", post(accounts::forgot))
+        .route("/api/auth/reset", post(accounts::reset))
+        .route("/api/me", get(me))
+        .route("/api/invoices", get(records))
+        .route("/api/upload", post(upload))
+        .route("/api/invoices/{id}", get(invoice))
+        .route("/api/invoices/reread", post(reread_review))
+        .route("/api/invoices/{id}/approve", post(approve))
+        .route("/api/invoices/{id}/exclude", post(exclude))
+        .route("/api/invoices/{id}/delete", post(delete_invoice))
+        .route("/api/invoices/{id}/document", get(document))
+        .route("/api/export", get(export))
+        .route("/api/stores", post(add_store))
+        .route("/api/stores/{id}", post(update_store))
+        .route("/api/connections", get(connections))
+        .route("/api/connections/{provider}/start", post(connect))
+        .route("/api/connections/{provider}/disconnect", post(disconnect))
+        .route("/api/sync", post(sync))
+        .route("/api/oauth/{provider}/callback", get(callback))
+        .route("/api/activity", get(activity))
+        .route("/api/invitations", post(invite))
+        .route("/api/invitations/accept", post(accept_invite))
+        .route("/api/workspaces/{id}/select", post(switch_workspace))
+        .route("/api/consents", get(consent_history))
+        .route("/api/members", get(members))
+        .route("/api/members/{id}/remove", post(remove_member))
+        .layer(DefaultBodyLimit::max(25 * 1024 * 1024))
+        .layer(middleware::from_fn_with_state(app.clone(), security))
+        .with_state(app)
+}
+
+/// Loads the private environment file: the one `INVOICE_CONFIG_FILE` names (which must exist), or
+/// `.env` when present. A line that cannot be read stops loading part-way, so settings after it
+/// would silently be missing; that is a startup error, not a quiet partial configuration.
+fn load_env_file(explicit: Option<std::ffi::OsString>) -> Result<()> {
+    let result = match &explicit {
+        Some(path) => dotenvy::from_path(path),
+        None => dotenvy::dotenv().map(|_| ()),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if explicit.is_none() && error.not_found() => Ok(()),
+        Err(error) => {
+            let path = explicit.unwrap_or_else(|| ".env".into());
+            Err(env_file_error(
+                &error,
+                &std::fs::read_to_string(path).unwrap_or_default(),
+            ))
+        }
+    }
+}
+
+/// The setting whose line holds `unreadable` (the part of the line the parser rejected), found by
+/// looking in the file's own text. Only a name is ever returned, never any of the value.
+fn setting_with_unreadable_value(contents: &str, unreadable: &str) -> Option<String> {
+    if unreadable.trim().is_empty() {
+        return None;
+    }
+    contents
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .find_map(|line| {
+            let (name, value) = line.split_once('=')?;
+            let name = name.trim().trim_start_matches("export ").trim();
+            let plain = !name.is_empty()
+                && name.len() <= 64
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            (plain && value.contains(unreadable.trim())).then(|| name.to_string())
+        })
+}
+
+/// Describes an unreadable environment file without echoing any of its lines, which may hold
+/// secrets.
+fn env_file_error(error: &dotenvy::Error, contents: &str) -> anyhow::Error {
+    match error {
+        dotenvy::Error::LineParse(unreadable, _) => {
+            let which = match setting_with_unreadable_value(contents, unreadable) {
+                Some(name) => format!("the line for {name}"),
+                None => "a line".to_string(),
+            };
+            anyhow!(
+                "The environment file has {which} that could not be read, so later settings were not loaded. Put values that contain spaces or special characters in double quotes, for example NAME=\"Two Words\""
+            )
+        }
+        dotenvy::Error::Io(_) => anyhow!("The environment file could not be read"),
+        _ => anyhow!("The environment file refers to an unset variable or could not be used"),
+    }
+}
+
+/// Where to listen: `INVOICE_BIND` if set, otherwise the platform's `PORT` on all interfaces
+/// (Railway and most hosts route to it), otherwise loopback port 3030 for local use.
+fn resolve_bind(invoice_bind: Option<&str>, port: Option<&str>) -> String {
+    if let Some(bind) = invoice_bind.map(str::trim).filter(|v| !v.is_empty()) {
+        return bind.to_string();
+    }
+    match port.and_then(|p| p.trim().parse::<u16>().ok()) {
+        Some(port) if port > 0 => format!("0.0.0.0:{port}"),
+        _ => "127.0.0.1:3030".into(),
+    }
+}
+fn configured_bind() -> String {
+    resolve_bind(
+        std::env::var("INVOICE_BIND").ok().as_deref(),
+        std::env::var("PORT").ok().as_deref(),
+    )
 }
 
 #[tokio::main]
@@ -1207,10 +1513,19 @@ async fn main() -> Result<()> {
         println!("{}", serde_json::to_string(&output)?);
         return Ok(());
     }
+    if args.get(1).map(String::as_str) == Some("--generate-key") {
+        // For INVOICE_ENCRYPTION_KEY. Printed once; keep it in the host's secret variables and
+        // in a password manager, because without it every stored document is unrecoverable.
+        println!("{}", storage::generate_key());
+        eprintln!(
+            "Store this as INVOICE_ENCRYPTION_KEY and keep a copy somewhere safe and separate from the database."
+        );
+        return Ok(());
+    }
     if args.get(1).map(String::as_str) == Some("--healthcheck") {
         // For container HEALTHCHECK: the image has no curl. Exit 0 only for an HTTP 200.
         use std::io::{Read, Write};
-        let bind = std::env::var("INVOICE_BIND").unwrap_or("127.0.0.1:3030".into());
+        let bind = configured_bind();
         let port = bind.rsplit(':').next().unwrap_or("3030");
         let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}"))?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
@@ -1249,11 +1564,7 @@ async fn main() -> Result<()> {
         println!("{}", serde_json::to_string(&invoice)?);
         return Ok(());
     }
-    if let Some(path) = std::env::var_os("INVOICE_CONFIG_FILE") {
-        dotenvy::from_path(path)?;
-    } else {
-        dotenvy::dotenv().ok();
-    }
+    load_env_file(std::env::var_os("INVOICE_CONFIG_FILE"))?;
     if let Some(command) = args.get(1).map(String::as_str)
         && (command == "--backup" || command == "--verify-backup")
     {
@@ -1265,9 +1576,16 @@ async fn main() -> Result<()> {
             let snapshot = backup::create(&data, std::path::Path::new(target))?;
             println!("{}", snapshot.display());
         } else {
-            let key = std::env::var_os("INVOICE_ENCRYPTION_KEY_FILE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| data.join("encryption.key"));
+            // The same key sources the server uses; never generating one here.
+            let key = storage::load_key(
+                std::env::var("INVOICE_ENCRYPTION_KEY").ok().as_deref(),
+                std::env::var_os("INVOICE_ENCRYPTION_KEY_FILE")
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+                    .as_deref(),
+                &data,
+                false,
+            )?;
             let report = backup::verify(std::path::Path::new(target), &key)?;
             println!(
                 "{}",
@@ -1317,7 +1635,7 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
-    let bind = std::env::var("INVOICE_BIND").unwrap_or("127.0.0.1:3030".into());
+    let bind = configured_bind();
     let origin = std::env::var("INVOICE_ORIGIN")
         .unwrap_or("http://localhost:3030".into())
         .trim_end_matches('/')
@@ -1340,26 +1658,41 @@ async fn main() -> Result<()> {
             "Public deployments need RESEND_API_KEY (or SMTP_URL) and MAIL_FROM so account emails can be verified and passwords reset"
         ));
     }
-    let trusted_proxies = std::env::var("INVOICE_TRUSTED_PROXY")
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(|v| {
-            v.parse::<std::net::IpAddr>()
-                .map_err(|_| anyhow!("INVOICE_TRUSTED_PROXY must list IP addresses"))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let trusted_proxies =
+        trust::Cidr::parse_list(&std::env::var("INVOICE_TRUSTED_PROXY").unwrap_or_default())?;
+    let operator = legal::Operator::from_env();
+    let missing = operator.missing();
+    if !local && !missing.is_empty() {
+        return Err(anyhow!(
+            "Public deployments must say who runs them (the privacy policy and terms name this). Set: {}",
+            missing.join(", ")
+        ));
+    }
+    let signup_code = std::env::var("INVOICE_SIGNUP_CODE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    if !local
+        && signup_code.is_none()
+        && std::env::var("INVOICE_ALLOW_OPEN_SIGNUP").as_deref() != Ok("1")
+    {
+        return Err(anyhow!(
+            "Public deployments need INVOICE_SIGNUP_CODE, or INVOICE_ALLOW_OPEN_SIGNUP=1 to let anyone register"
+        ));
+    }
     let config = Config {
         origin: origin.clone(),
         demo,
         samples: std::env::var("INVOICE_SAMPLE_DIR").ok().map(PathBuf::from),
         trusted_proxies,
+        signup_code,
+        operator,
         gmail_api: mail::GMAIL_API.into(),
         graph_api: mail::GRAPH_API.into(),
     };
     let data = PathBuf::from(std::env::var("INVOICE_DATA_DIR").unwrap_or("data".into()));
-    let store = Store::open(&data)?;
+    // A public deployment must be given its key; only local use may create one.
+    let store = Store::open_with(&data, local)?;
     store.backfill_store_metadata()?;
     store.backfill_supplier_profiles()?;
     let queue = Arc::new(tokio::sync::Notify::new());
@@ -1479,6 +1812,429 @@ mod tests {
         json!({"revision":revision,"supplier":"Acme Parts Ltd","invoice_number":"A-1","invoice_date":"2026-10-01","due_date":"2026-10-31","currency":"CAD","subtotal":"100.00","tax":"5.00","total":"105.00","balance":"","po_number":"","store_id":store})
     }
 
+    async fn try_register(
+        f: &Fixture,
+        email: &str,
+        code: Option<&str>,
+        invite: Option<&str>,
+    ) -> (StatusCode, Option<Session>) {
+        let (status, body, cookie) = call(
+            &f.app,
+            "POST",
+            "/api/auth/register",
+            Some(json!({"email":email,"password":PASSWORD,"store_name":"Test","consent":true,"policy_version":crate::legal::POLICY_VERSION,"signup_code":code,"invite":invite})),
+            None,
+        )
+        .await;
+        let session = cookie.map(|cookie| Session {
+            cookie,
+            csrf: body["csrf"].as_str().unwrap_or("").to_string(),
+        });
+        (status, session)
+    }
+
+    #[tokio::test]
+    async fn the_privacy_policy_and_terms_are_public_pages_that_name_the_operator() {
+        let f = fixture_with(false, |c| {
+            c.operator.name = Some("Example Retail Inc.".into());
+            c.operator.privacy_email = Some("privacy@example.test".into());
+        });
+        for (path, title) in [
+            ("/privacy", "Privacy Policy"),
+            ("/terms", "Terms of Service"),
+        ] {
+            let response = raw(&f.app, "GET", path, None, None).await; // no session at all
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert!(
+                response.headers()["content-type"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("text/html")
+            );
+            assert!(
+                response.headers()["content-security-policy"]
+                    .to_str()
+                    .unwrap()
+                    .contains("default-src 'self'")
+            );
+            let body = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            let html = String::from_utf8(body.to_vec()).unwrap();
+            assert!(
+                html.contains(title) && html.contains("Example Retail Inc."),
+                "{path}"
+            );
+            assert!(html.contains("<h2>"), "{path} is rendered, not raw text");
+        }
+        let (status, info, _) = call(&f.app, "GET", "/api/privacy", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(info["version"], crate::legal::POLICY_VERSION);
+        assert!(
+            info["notice_html"]
+                .as_str()
+                .unwrap()
+                .contains("<h2>Who we are</h2>")
+        );
+        assert!(
+            info["terms_html"]
+                .as_str()
+                .unwrap()
+                .contains("Example Retail Inc.")
+        );
+    }
+
+    #[tokio::test]
+    async fn registering_records_consent_to_both_documents_and_their_version() {
+        let f = fixture(false);
+        register(&f.app, "owner@example.test").await;
+        let rows: Vec<(String, String)> = f
+            .app
+            .store
+            .db
+            .lock()
+            .unwrap()
+            .prepare("SELECT kind,version FROM consents ORDER BY kind")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "account_processing".to_string(),
+                    crate::legal::POLICY_VERSION.to_string()
+                ),
+                (
+                    "terms_of_service".to_string(),
+                    crate::legal::POLICY_VERSION.to_string()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_an_account_needs_the_password_and_a_typed_confirmation() {
+        let f = fixture(false);
+        let owner = register(&f.app, "owner@example.test").await;
+        let other = register(&f.app, "other@example.test").await;
+        let (id, _store) = waiting_record(&f, &owner).await;
+        let path = "/api/auth/delete-account";
+        let delete = |password: &'static str, confirm: &'static str| json!({"password":password,"confirm":confirm});
+
+        let (status, reply, _) = call(
+            &f.app,
+            "POST",
+            path,
+            Some(delete(PASSWORD, "delete me")),
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+        let (status, reply, _) = call(
+            &f.app,
+            "POST",
+            path,
+            Some(delete("wrong password here", "DELETE")),
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{reply}");
+        assert_eq!(
+            call(&f.app, "GET", "/api/me", None, Some(&owner)).await.0,
+            StatusCode::OK,
+            "still signed in and intact"
+        );
+        // Nobody can delete someone else's account: the request always acts on the session's own.
+        assert_eq!(
+            call(&f.app, "POST", path, Some(delete(PASSWORD, "DELETE")), None)
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let response = raw(
+            &f.app,
+            "POST",
+            path,
+            Some(delete(PASSWORD, "DELETE")),
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()["set-cookie"]
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0")
+        );
+        assert_eq!(
+            call(&f.app, "GET", "/api/me", None, Some(&owner)).await.0,
+            StatusCode::UNAUTHORIZED,
+            "the session is gone"
+        );
+        assert_eq!(
+            login(&f.app, "owner@example.test", PASSWORD).await.0,
+            StatusCode::UNAUTHORIZED,
+            "so is the account"
+        );
+        assert!(
+            f.app.store.record_exists_anywhere(&id).unwrap().not(),
+            "and the invoice data"
+        );
+        // The other person is unaffected.
+        assert_eq!(
+            call(&f.app, "GET", "/api/me", None, Some(&other)).await.0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn an_owner_with_other_members_is_told_to_remove_them_first() {
+        let f = fixture(false);
+        let owner = register(&f.app, "owner@example.test").await;
+        let member = register(&f.app, "member@example.test").await;
+        let workspace = me(&f.app, &owner).await["workspace"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let member_id = f
+            .app
+            .store
+            .account_by_email("member@example.test")
+            .unwrap()
+            .unwrap()
+            .0;
+        f.app
+            .store
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO memberships VALUES (?1,?2,'member')",
+                rusqlite::params![workspace, member_id],
+            )
+            .unwrap();
+        let (status, reply, _) = call(
+            &f.app,
+            "POST",
+            "/api/auth/delete-account",
+            Some(json!({"password":PASSWORD,"confirm":"DELETE"})),
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(reply["error"].as_str().unwrap().contains("Team access"));
+        assert_eq!(
+            call(&f.app, "GET", "/api/me", None, Some(&owner)).await.0,
+            StatusCode::OK
+        );
+        let _ = member;
+    }
+
+    #[tokio::test]
+    async fn registration_can_be_limited_to_people_with_a_code_or_an_invitation() {
+        let f = fixture_with(false, |c| c.signup_code = Some("pilot-code".into()));
+        let (_, options, _) = call(&f.app, "GET", "/api/auth/options", None, None).await;
+        assert_eq!(options["signup_code_required"], true);
+
+        for (code, why) in [
+            (None, "no code"),
+            (Some(""), "empty"),
+            (Some("pilot-cod"), "near miss"),
+            (Some("PILOT-CODE"), "wrong case"),
+        ] {
+            let (status, session) = try_register(&f, "stranger@example.test", code, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{why}");
+            assert!(session.is_none(), "{why}: no session may be issued");
+        }
+        assert!(
+            f.app
+                .store
+                .account_by_email("stranger@example.test")
+                .unwrap()
+                .is_none(),
+            "nothing was created"
+        );
+
+        let (status, owner) =
+            try_register(&f, "owner@example.test", Some("  pilot-code "), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let owner = owner.unwrap();
+
+        // An owner's invitation lets that one address register without the code.
+        let (_, invitation, _) = call(
+            &f.app,
+            "POST",
+            "/api/invitations",
+            Some(json!({"email":"Teammate@Example.test"})),
+            Some(&owner),
+        )
+        .await;
+        let token = invitation["url"]
+            .as_str()
+            .unwrap()
+            .split("invite=")
+            .nth(1)
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            try_register(&f, "someone-else@example.test", None, Some(&token))
+                .await
+                .0,
+            StatusCode::FORBIDDEN,
+            "wrong address"
+        );
+        assert_eq!(
+            try_register(&f, "teammate@example.test", None, Some("not-a-real-token"))
+                .await
+                .0,
+            StatusCode::FORBIDDEN,
+            "unknown token"
+        );
+        f.app
+            .store
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE invitations SET expires=1", [])
+            .unwrap();
+        assert_eq!(
+            try_register(&f, "teammate@example.test", None, Some(&token))
+                .await
+                .0,
+            StatusCode::FORBIDDEN,
+            "expired"
+        );
+        f.app
+            .store
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE invitations SET expires=?1",
+                [chrono::Utc::now().timestamp() + 3600],
+            )
+            .unwrap();
+        assert_eq!(
+            try_register(&f, "teammate@example.test", None, Some(&token))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_signup_code_registration_stays_open_for_local_use() {
+        let f = fixture(false);
+        let (_, options, _) = call(&f.app, "GET", "/api/auth/options", None, None).await;
+        assert_eq!(options["signup_code_required"], false);
+        assert_eq!(
+            try_register(&f, "owner@example.test", None, None).await.0,
+            StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn secrets_compare_equal_only_when_identical() {
+        assert!(super::same_secret("pilot-code", "pilot-code"));
+        for other in ["pilot-cod", "pilot-code ", "Pilot-code", "", "x"] {
+            assert!(!super::same_secret(other, "pilot-code"), "{other:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn https_deployments_use_a_host_prefixed_cookie_and_accept_no_other() {
+        let f = fixture_with(false, |c| c.origin = "https://sumline.example.test".into());
+        let response = raw(
+            &f.app,
+            "POST",
+            "/api/auth/register",
+            Some(json!({"email":"owner@example.test","password":PASSWORD,"store_name":"Test","consent":true,"policy_version":crate::legal::POLICY_VERSION})),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let header = response.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(header.starts_with("__Host-it_session="), "{header}");
+        for required in ["Secure", "HttpOnly", "Path=/", "SameSite=Lax"] {
+            assert!(
+                header.contains(required),
+                "{required} missing from {header}"
+            );
+        }
+        assert!(
+            !header.contains("Domain"),
+            "a __Host- cookie must not name a domain"
+        );
+
+        let pair = header.split(';').next().unwrap().to_string();
+        let csrf = {
+            let body = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            serde_json::from_slice::<Value>(&body).unwrap()["csrf"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let session = Session {
+            cookie: pair.clone(),
+            csrf: csrf.clone(),
+        };
+        assert_eq!(
+            call(&f.app, "GET", "/api/me", None, Some(&session)).await.0,
+            StatusCode::OK
+        );
+
+        // The same value under the plain name, as a sibling subdomain could plant it, is ignored.
+        let planted = Session {
+            cookie: pair.replacen("__Host-it_session", "it_session", 1),
+            csrf,
+        };
+        assert_eq!(
+            call(&f.app, "GET", "/api/me", None, Some(&planted)).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Signing out expires the same cookie.
+        let out = raw(&f.app, "POST", "/api/auth/logout", None, Some(&session)).await;
+        let cleared = out.headers()["set-cookie"].to_str().unwrap().to_string();
+        assert!(
+            cleared.starts_with("__Host-it_session=;")
+                && cleared.contains("Max-Age=0")
+                && cleared.contains("Secure")
+        );
+    }
+
+    #[tokio::test]
+    async fn local_http_keeps_the_plain_cookie_name() {
+        let f = fixture(false);
+        let response = raw(
+            &f.app,
+            "POST",
+            "/api/auth/register",
+            Some(json!({"email":"owner@example.test","password":PASSWORD,"store_name":"Test","consent":true,"policy_version":crate::legal::POLICY_VERSION})),
+            None,
+        )
+        .await;
+        let header = response.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            header.starts_with("it_session=") && !header.contains("Secure"),
+            "{header}"
+        );
+    }
+
     #[tokio::test]
     async fn the_review_form_only_accepts_the_offered_currencies() {
         let f = fixture(false);
@@ -1526,21 +2282,92 @@ mod tests {
         value.parse().unwrap()
     }
 
+    fn trusted(list: &str) -> Vec<crate::trust::Cidr> {
+        crate::trust::Cidr::parse_list(list).unwrap()
+    }
+
+    #[test]
+    fn the_listening_address_follows_the_platform_port_when_not_set_explicitly() {
+        use super::resolve_bind;
+        assert_eq!(
+            resolve_bind(None, None),
+            "127.0.0.1:3030",
+            "local default is loopback"
+        );
+        assert_eq!(
+            resolve_bind(None, Some("8080")),
+            "0.0.0.0:8080",
+            "a platform port is public-facing"
+        );
+        assert_eq!(
+            resolve_bind(Some("127.0.0.1:4000"), Some("8080")),
+            "127.0.0.1:4000",
+            "explicit wins"
+        );
+        assert_eq!(
+            resolve_bind(Some("  "), Some("8080")),
+            "0.0.0.0:8080",
+            "blank counts as unset"
+        );
+        for bad in ["", "abc", "0", "70000", "-1"] {
+            assert_eq!(resolve_bind(None, Some(bad)), "127.0.0.1:3030", "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_environment_line_is_an_error_that_names_the_setting_not_its_value() {
+        use super::load_env_file;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.env");
+        std::fs::write(
+            &path,
+            "SUMLINE_TEST_ENV_FIRST=one\nSUMLINE_TEST_ENV_NAME=Two Words secret-value-9f3\nSUMLINE_TEST_ENV_AFTER=three\n",
+        )
+        .unwrap();
+        let error = load_env_file(Some(path.clone().into_os_string())).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("SUMLINE_TEST_ENV_NAME"), "{text}");
+        assert!(text.contains("double quotes"), "{text}");
+        assert!(
+            !text.contains("secret-value-9f3"),
+            "the value must not be echoed"
+        );
+        assert!(
+            std::env::var("SUMLINE_TEST_ENV_AFTER").is_err(),
+            "settings after the bad line were not loaded, which is why startup must stop"
+        );
+
+        std::fs::write(
+            &path,
+            "SUMLINE_TEST_ENV_QUOTED=\"Two Words and More\"\n# a comment\nSUMLINE_TEST_ENV_PLAIN=plain\n",
+        )
+        .unwrap();
+        load_env_file(Some(path.into_os_string())).unwrap();
+        assert_eq!(
+            std::env::var("SUMLINE_TEST_ENV_QUOTED").unwrap(),
+            "Two Words and More"
+        );
+        assert_eq!(std::env::var("SUMLINE_TEST_ENV_PLAIN").unwrap(), "plain");
+    }
+
+    #[test]
+    fn a_named_environment_file_must_exist_but_the_default_one_may_be_absent() {
+        use super::load_env_file;
+        let missing = std::path::PathBuf::from("/nonexistent/sumline/config.env");
+        assert!(load_env_file(Some(missing.into_os_string())).is_err());
+    }
+
     #[test]
     fn forwarded_address_is_only_believed_from_a_configured_proxy() {
-        let proxies = [ip("127.0.0.1")];
-        // The proxy appends the real client last; earlier entries are client-supplied.
+        let caddy = trusted("127.0.0.1");
+        // The proxy writes the real visitor; anything a visitor put further left is never reached.
         assert_eq!(
-            client_key(
-                &proxies,
-                Some(ip("127.0.0.1")),
-                Some("6.6.6.6, 203.0.113.9")
-            ),
+            client_key(&caddy, Some(ip("127.0.0.1")), Some("6.6.6.6, 203.0.113.9")),
             "203.0.113.9"
         );
         // A direct caller cannot choose its own rate-limit bucket.
         assert_eq!(
-            client_key(&proxies, Some(ip("198.51.100.4")), Some("203.0.113.9")),
+            client_key(&caddy, Some(ip("198.51.100.4")), Some("203.0.113.9")),
             "198.51.100.4"
         );
         // Nothing configured: always the connecting address.
@@ -1550,8 +2377,54 @@ mod tests {
         );
         // A garbage header from the proxy falls back to the proxy address.
         assert_eq!(
-            client_key(&proxies, Some(ip("127.0.0.1")), Some("not-an-ip")),
+            client_key(&caddy, Some(ip("127.0.0.1")), Some("not-an-ip")),
             "127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn internal_hops_after_the_visitor_are_skipped_as_on_railway() {
+        let railway = trusted("private, 100.0.0.0/8");
+        // Visitor first, then two of the platform's own hops.
+        assert_eq!(
+            client_key(
+                &railway,
+                Some(ip("100.64.0.7")),
+                Some("203.0.113.9, 100.64.0.3, 100.64.0.2")
+            ),
+            "203.0.113.9"
+        );
+        // Different visitors get different buckets, whatever hops follow.
+        assert_ne!(
+            client_key(
+                &railway,
+                Some(ip("100.64.0.7")),
+                Some("203.0.113.9, 100.64.0.3")
+            ),
+            client_key(
+                &railway,
+                Some(ip("100.64.0.7")),
+                Some("198.51.100.2, 100.64.0.3")
+            )
+        );
+        // A forged leftmost entry only matters if no real visitor sits to its right.
+        assert_eq!(
+            client_key(
+                &railway,
+                Some(ip("100.64.0.7")),
+                Some("1.1.1.1, 203.0.113.9, 100.64.0.3")
+            ),
+            "203.0.113.9"
+        );
+        // Every entry internal: fall back to the peer rather than invent an address.
+        assert_eq!(
+            client_key(&railway, Some(ip("100.64.0.7")), Some("100.64.0.3")),
+            "100.64.0.7"
+        );
+        // Someone outside the platform cannot use the header at all.
+        assert_eq!(
+            client_key(&railway, Some(ip("198.51.100.4")), Some("203.0.113.9")),
+            "198.51.100.4"
         );
     }
 }

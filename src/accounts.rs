@@ -16,7 +16,10 @@ const VERIFY_TTL_SECONDS: i64 = 24 * 3600;
 const RESET_TTL_SECONDS: i64 = 3600;
 
 pub async fn options(State(app): State<App>) -> Json<Value> {
-    Json(json!({"mail_enabled": app.mailer.enabled()}))
+    Json(json!({
+        "mail_enabled": app.mailer.enabled(),
+        "signup_code_required": app.config.signup_code.is_some(),
+    }))
 }
 
 fn valid_email(email: &str) -> bool {
