@@ -1281,11 +1281,39 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if args.get(1).map(String::as_str) == Some("--test-email") {
+        // Sends one plain message with the configured mail backend, to prove the key, the
+        // verified sending domain and the sender address work before anyone depends on them.
+        let to = args
+            .get(2)
+            .ok_or_else(|| anyhow!("Usage: --test-email <your address>"))?;
+        let mailer = outbound::Mailer::from_env()?;
+        if !mailer.enabled() {
+            return Err(anyhow!(
+                "No mail backend is configured (RESEND_API_KEY or SMTP_URL, and MAIL_FROM)"
+            ));
+        }
+        mailer
+            .send(
+                to,
+                &format!("{} test message", branding::NAME),
+                format!(
+                    "This message confirms that {} can send email from this deployment.\n",
+                    branding::NAME
+                ),
+            )
+            .await?;
+        println!(
+            "Sent a test message to {to} using {}.",
+            mailer.provider().unwrap_or("mail")
+        );
+        return Ok(());
+    }
     if args.get(1).map(String::as_str) == Some("--check-config") {
         let origin = std::env::var("INVOICE_ORIGIN").unwrap_or("http://localhost:3030".into());
         println!(
             "{}",
-            json!({"origin":origin,"google_callback":format!("{origin}/api/oauth/google/callback"),"google_configured":(["GOOGLE_CLIENT_ID","GOOGLE_CLIENT_SECRET"].iter().all(|key|std::env::var(key).is_ok_and(|v|!v.trim().is_empty()))),"microsoft_configured":(["MICROSOFT_CLIENT_ID","MICROSOFT_CLIENT_SECRET"].iter().all(|key|std::env::var(key).is_ok_and(|v|!v.trim().is_empty()))),"smtp_configured":outbound::Mailer::from_env().is_ok_and(|m|m.enabled()),"sample_login_enabled":std::env::var("INVOICE_DEMO").as_deref()==Ok("1"),"initial_lookback_days":mail::lookback_days()})
+            json!({"origin":origin,"google_callback":format!("{origin}/api/oauth/google/callback"),"google_configured":(["GOOGLE_CLIENT_ID","GOOGLE_CLIENT_SECRET"].iter().all(|key|std::env::var(key).is_ok_and(|v|!v.trim().is_empty()))),"microsoft_configured":(["MICROSOFT_CLIENT_ID","MICROSOFT_CLIENT_SECRET"].iter().all(|key|std::env::var(key).is_ok_and(|v|!v.trim().is_empty()))),"mail_provider":outbound::Mailer::from_env().ok().and_then(|m|m.provider()),"sample_login_enabled":std::env::var("INVOICE_DEMO").as_deref()==Ok("1"),"initial_lookback_days":mail::lookback_days()})
         );
         return Ok(());
     }
@@ -1309,7 +1337,7 @@ async fn main() -> Result<()> {
         && std::env::var("INVOICE_ALLOW_UNVERIFIED_EMAIL").as_deref() != Ok("1")
     {
         return Err(anyhow!(
-            "Public deployments need SMTP_URL and MAIL_FROM so account emails can be verified and passwords reset"
+            "Public deployments need RESEND_API_KEY (or SMTP_URL) and MAIL_FROM so account emails can be verified and passwords reset"
         ));
     }
     let trusted_proxies = std::env::var("INVOICE_TRUSTED_PROXY")

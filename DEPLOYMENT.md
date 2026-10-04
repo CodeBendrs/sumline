@@ -25,13 +25,13 @@ All settings are environment variables (or an `INVOICE_CONFIG_FILE` env file kep
 | `INVOICE_TRUSTED_PROXY` | the proxy's address as the app sees it, for example `127.0.0.1` |
 | `INVOICE_DATA_DIR` | a persistent, encrypted volume |
 | `INVOICE_ENCRYPTION_KEY_FILE` | a 32-byte key file on a different volume or secret store than the data |
-| `SMTP_URL`, `MAIL_FROM` | your mail provider; required, because a public deployment will not start without them |
+| `RESEND_API_KEY` (or `SMTP_URL`), `MAIL_FROM` | your mail provider; one is required, because a public deployment will not start without it. Prefer Resend on hosts that block outbound SMTP (Railway below Pro). Setting both is refused. |
 | `GOOGLE_CLIENT_ID/SECRET`, `MICROSOFT_CLIENT_ID/SECRET` | from each provider's console, with the redirect URI `https://your-host/api/oauth/<provider>/callback` |
 | `INVOICE_DEMO` | `0` (the sample login only works on loopback anyway) |
 
 Check what the process sees, without printing any secret: `invoice-tracker --check-config`.
 
-Account email only works well from a domain you control with SPF and DKIM published for the sending service; otherwise verification and reset messages are likely to land in spam.
+Account email only works well from a domain you control with SPF and DKIM published for the sending service; otherwise verification and reset messages are likely to land in spam. With Resend, verify a sending subdomain (for example `mail.sumline.example`) so the main domain's own mail reputation is not shared, add the DNS records it lists, create an API key limited to sending, then run `invoice-tracker --test-email you@example.com` (on Railway: `railway run` or the service shell) before inviting anyone.
 
 ## HTTPS
 
