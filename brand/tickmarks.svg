@@ -1,0 +1,13 @@
+<!-- SumLine tick marks: 20px grid, 1.75 stroke, round caps and joins, colored by currentColor.
+     Use inline (<svg><use href="#t-ready"/></svg>) after embedding this sprite, or copy a symbol's contents. See BRAND.md. -->
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none">
+  <symbol id="t-ready" viewBox="0 0 20 20"><path d="M4.5 10.5l3.5 3.5 7.5-8" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="t-approved" viewBox="0 0 20 20"><g fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 8.5l3.5 3.5 7.5-8"/><path d="M4.5 16.25h11"/></g></symbol>
+  <symbol id="t-review" viewBox="0 0 20 20"><path d="M7 7.2a3 3 0 1 1 4.6 2.5c-.9.6-1.6 1.2-1.6 2.3v.5" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/><circle cx="10" cy="15.7" r="1.15" fill="currentColor"/></symbol>
+  <symbol id="t-processing" viewBox="0 0 20 20"><circle cx="10" cy="10" r="6" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-dasharray="2.4 2.3"/></symbol>
+  <symbol id="t-bundle" viewBox="0 0 20 20"><path d="M10 3.5v5M10 8.5l-5 4.5v3.5M10 8.5l5 4.5v3.5" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="t-excluded" viewBox="0 0 20 20"><g fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"><circle cx="10" cy="10" r="6"/><path d="M6.75 10h6.5"/></g></symbol>
+  <symbol id="t-footed" viewBox="0 0 20 20"><path d="M14.5 4.5h-9l5 5.5-5 5.5h9" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="t-filed" viewBox="0 0 20 20"><path d="M3 10h9.5M9 6.5l3.5 3.5L9 13.5M16 4.5v11" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="t-source" viewBox="0 0 20 20"><g fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 3.5h5l3 3v9a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-11a1 1 0 0 1 1-1z"/><path d="M11.5 3.5v3h3"/></g></symbol>
+</svg>

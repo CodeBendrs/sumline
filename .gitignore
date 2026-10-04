@@ -1,0 +1,14 @@
+/target/
+/data/
+/.env
+/samples/
+/test-output/
+/bin/
+/.code-review-graph/
+*.sqlite*
+*.key
+*.pdf
+*.xlsx
+
+__pycache__/
+test-fixtures/

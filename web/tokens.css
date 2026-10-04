@@ -1,0 +1,50 @@
+/* SumLine brand tokens. Source of truth: BRAND.md.
+   Light is the default. Dark values apply only under [data-theme="dark"], so importing this
+   file never flips an interface that has not been built for dark mode yet. */
+
+:root {
+  /* Core */
+  --pad: #F1F5EE;            /* page background */
+  --sheet: #FCFDFB;          /* cards, tables, drawers, dialogs */
+  --rule: #CFDDD2;           /* hairlines, table row dividers */
+  --rule-strong: #9DB8A5;    /* emphasized dividers, dashed drop zones */
+  --control-border: #78967F; /* input and button outlines (3:1 on sheet) */
+  --ink: #15291F;            /* text and figures */
+  --ink-2: #4D6157;          /* secondary text, labels (6:1 on pad) */
+  --ledger: #225447;         /* brand, primary actions, links, focus ring */
+  --on-ledger: #FFFFFF;      /* text on ledger fills */
+  --mint: #DCE8DE;           /* selected rows, active navigation */
+  --mark: #225447;           /* the Tick mark */
+
+  /* Status: ink on its own tint, always paired with a tick mark and a word */
+  --ok: #3B6B34;      --ok-tint: #E3EFDC;      /* ready, approved, checks passed */
+  --hold: #8A5A12;    --hold-tint: #F7EBD2;    /* needs review */
+  --flow: #3C6589;    --flow-tint: #E4ECF4;    /* processing, syncing */
+  --void: #5E6862;    --void-tint: #EDEFEC;    /* excluded, split attachment */
+  --stop: #A3362C;    --stop-tint: #F9E4E0;    /* failures, destructive actions */
+
+  /* Type */
+  --font-display: "Archivo", "Helvetica Neue", Arial, sans-serif;  /* use with font-stretch: 112% */
+  --font-body: "Atkinson Hyperlegible Next", "Atkinson Hyperlegible", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Atkinson Hyperlegible Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+:root[data-theme="dark"] {
+  --pad: #0E1814;
+  --sheet: #15221D;
+  --rule: #26392F;
+  --rule-strong: #3A5246;
+  --control-border: #5E7A6C;
+  --ink: #E3ECE5;
+  --ink-2: #9AB0A4;
+  --ledger: #8FD0B3;
+  --on-ledger: #0E1814;
+  --mint: #1D3229;
+  --mark: #9AD3B9;
+  --ok: #9CCB8C;      --ok-tint: #1B2A19;
+  --hold: #E2B262;    --hold-tint: #2E2413;
+  --flow: #94B9DC;    --flow-tint: #17222E;
+  --void: #A3ACA6;    --void-tint: #1F2522;
+  --stop: #F0907F;    --stop-tint: #341B17;
+  color-scheme: dark;
+}

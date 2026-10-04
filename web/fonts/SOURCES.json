@@ -1,0 +1,26 @@
+[
+  {
+    "family": "Archivo",
+    "file": "archivo.woff2",
+    "source": "https://fonts.gstatic.com/s/archivo/v25/k3kQo8UDI-1M0wlSfdnoLmvDIaI.woff2",
+    "license_source": "https://raw.githubusercontent.com/google/fonts/main/ofl/archivo/OFL.txt",
+    "sha256": "4c98b9d490d1698ec95f2ff17a6c7d0e72691864c0c5d7bc2a2c161b45afe5ad",
+    "subset": "latin"
+  },
+  {
+    "family": "Atkinson Hyperlegible Mono",
+    "file": "atkinson-mono.woff2",
+    "source": "https://fonts.gstatic.com/s/atkinsonhyperlegiblemono/v8/tss4AoFBci4C4gvhPXrt3wjT1MqSzhA4t7IIcncBiwKthFyDHi0j.woff2",
+    "license_source": "https://raw.githubusercontent.com/google/fonts/main/ofl/atkinsonhyperlegiblemono/OFL.txt",
+    "sha256": "f0230cab68ecdc96766fde00a89cf3167e668c3a8756f844cab554dc3bcfd030",
+    "subset": "latin"
+  },
+  {
+    "family": "Atkinson Hyperlegible Next",
+    "file": "atkinson-next.woff2",
+    "source": "https://fonts.gstatic.com/s/atkinsonhyperlegiblenext/v7/NaPNcYPdHfdVxJw0IfIP0lvYFqijb-UxCtm5_wdGseiJn3q0pkZ_.woff2",
+    "license_source": "https://raw.githubusercontent.com/google/fonts/main/ofl/atkinsonhyperlegiblenext/OFL.txt",
+    "sha256": "1e4cea71d75ec427581d6259fc07148a2e60d60d16cabf4b4f5360487b3f9dc3",
+    "subset": "latin"
+  }
+]

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <title>SumLine</title>
+  <path fill="none" stroke="#225447" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" d="M5 10.25L9.5 14.75L19.25 3.25"/>
+  <path fill="#225447" d="M2.5 15.5H21.5V18.25H2.5ZM2.5 19.75H21.5V22.5H2.5Z"/>
+</svg>
