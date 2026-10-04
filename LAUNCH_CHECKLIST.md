@@ -13,7 +13,8 @@ Last updated 2026-10-04. This is a working list, not a claim of readiness. SumLi
 | `/healthz` and `--healthcheck` | Tested against a running instance; Dockerfile `HEALTHCHECK` added but the image is unbuilt |
 | Template-independent invoice reading, and a **Re-read documents** action for records in review | 18 new Rust tests including synthetic layouts; the five real invoices run end to end on a scratch instance (no address -> all in review; add address, re-read -> three ready, two correctly held). Generic reader matched 50 of 50 fields on the five real layouts with the hard-coded parsers switched off, but it was tuned on those five. |
 | Supplier memory, generic line items, right-typed review fields (CAD/USD dropdown, numeric amounts, supplier suggestions) | Unit and router tests; the real Jacked Factory invoice held, approved, then a second invoice from that supplier in a different layout went straight to ready while another supplier stayed held; line items matched the validated parsers on 189 of 190 fields and reached the exported workbook. Only five real layouts tried. |
-| Existing behaviour unaffected | 64 Rust tests, clippy with warnings denied, and `tests/smoke.py` (without the supplied sample PDFs) pass |
+| Incremental, jittered mailbox checks (Gmail history cursor, resumable scans, quiet logging, backoff) | Fake-Gmail tests that assert the exact calls: a quiet check is one history call, an arrival is history, list, one fetch, a 35-page backlog pauses and finishes, an expired cursor rescans without duplicates. Not yet run against Outlook. |
+| Existing behaviour unaffected | 71 Rust tests, clippy with warnings denied, and `tests/smoke.py` (without the supplied sample PDFs) pass |
 
 ## B. Needs you, in this order
 
@@ -37,7 +38,7 @@ Each step names what I do once you finish it. Never paste secrets into chat; put
 - Account closure and data deletion for a user and for a workspace (the privacy notice already promises a process).
 - Workspace-owner transfer.
 - Optional two-factor sign-in (TOTP).
-- A persisted continuation cursor for large mailbox backfills.
+- Outlook incremental sync (per-folder delta tracking and a resumable backfill); it needs a Microsoft account to test properly.
 - Per-store access restrictions.
 - Learn from corrections: when a person fixes a supplier or field in review, use that next time.
 - Measure the reader on your real invoices (step 2) and fix whatever it gets wrong.

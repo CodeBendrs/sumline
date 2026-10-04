@@ -29,6 +29,8 @@ pub fn fixture(mail: bool) -> Fixture {
             demo: false,
             samples: None,
             trusted_proxies: Vec::new(),
+            gmail_api: crate::mail::GMAIL_API.into(),
+            graph_api: crate::mail::GRAPH_API.into(),
         }),
         http: reqwest::Client::new(),
         queue: Arc::new(tokio::sync::Notify::new()),

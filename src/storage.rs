@@ -36,6 +36,19 @@ fn migrate_accounts(db: &Connection) -> Result<()> {
     if !columns.iter().any(|v| v == "email_verified_at") {
         db.execute("ALTER TABLE accounts ADD COLUMN email_verified_at TEXT", [])?;
     }
+    // Incremental mailbox sync: the provider's change cursor, and an unfinished scan to resume.
+    let connector_columns: Vec<String> = db
+        .prepare("PRAGMA table_info(connectors)")?
+        .query_map([], |r| r.get(1))?
+        .collect::<std::result::Result<_, _>>()?;
+    for column in ["cursor", "scan_state"] {
+        if !connector_columns.iter().any(|v| v == column) {
+            db.execute(
+                &format!("ALTER TABLE connectors ADD COLUMN {column} TEXT"),
+                [],
+            )?;
+        }
+    }
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS email_tokens(hash TEXT PRIMARY KEY, account TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, purpose TEXT NOT NULL CHECK(purpose IN ('verify','reset')), email TEXT NOT NULL, created INTEGER NOT NULL, expires INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS email_tokens_account ON email_tokens(account,purpose);

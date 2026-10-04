@@ -43,6 +43,9 @@ pub struct Config {
     samples: Option<PathBuf>,
     /// Peers whose `X-Forwarded-For` header is believed (a reverse proxy we run ourselves).
     trusted_proxies: Vec<std::net::IpAddr>,
+    /// Mailbox API roots. Always the real providers outside tests, which point them at a fake.
+    gmail_api: String,
+    graph_api: String,
 }
 #[derive(Clone)]
 pub struct App {
@@ -1324,6 +1327,8 @@ async fn main() -> Result<()> {
         demo,
         samples: std::env::var("INVOICE_SAMPLE_DIR").ok().map(PathBuf::from),
         trusted_proxies,
+        gmail_api: mail::GMAIL_API.into(),
+        graph_api: mail::GRAPH_API.into(),
     };
     let data = PathBuf::from(std::env::var("INVOICE_DATA_DIR").unwrap_or("data".into()));
     let store = Store::open(&data)?;
