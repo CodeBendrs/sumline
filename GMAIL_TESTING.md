@@ -12,14 +12,14 @@ The app is prepared for a local test. Live OAuth and mailbox capture still need 
    `http://localhost:3030/api/oauth/google/callback`
 
    Use `localhost` consistently, including in the browser. This is a local Rust web server using Google's [web-server authorization flow](https://developers.google.com/identity/protocols/oauth2/web-server).
-5. Run `Live-Test.command` from the Gold project folder once. It creates a private configuration template at `~/Library/Application Support/InvoiceTracker-Live-Test/config.env`. Stop that server with Control-C, add your `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` to that file locally, then run the launcher again. Keep secrets out of chat and Git.
+5. Run `scripts/live-test.sh` from the repository once. It creates a private configuration template at `~/.sumline-live-test/config.env` (set `SUMLINE_LIVE_TEST_DIR` to use another directory). Stop that server with Control-C, add your `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` to that file locally, then run the launcher again. Keep secrets out of chat and Git.
 
-The launcher keeps the test database and encryption key in that private Application Support directory, disables the shared sample login, binds to loopback, and limits the first scan to the last day. Stop the existing preview before starting it: both use port 3030. Your Mac and the server must remain running for scheduled checks.
+The launcher keeps the test database and encryption key in that private directory, disables the shared sample login, binds to loopback, and limits the first scan to the last day. Stop the existing preview before starting it: both use port 3030. The computer and the server must remain running for scheduled checks.
 
 Optional configuration check (prints booleans, not credentials):
 
 ```sh
-INVOICE_CONFIG_FILE="$HOME/Library/Application Support/InvoiceTracker-Live-Test/config.env" ./bin/invoice-tracker --check-config
+INVOICE_CONFIG_FILE="$HOME/.sumline-live-test/config.env" cargo run --locked --bin sumline -- --check-config
 ```
 
 ## Connect your mailbox
