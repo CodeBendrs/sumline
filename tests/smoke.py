@@ -135,7 +135,7 @@ def run():
     for record in children:a.request('/api/invoices/'+record['id']+'/delete',method='POST')
     if SAMPLES:
         expected=[('INVEHPCA124319',79200,3960,83160,'2026-10-02','2026-11-01',1,1),('19829',193980,9700,203680,'2026-09-15','2026-10-15',1,7),('219925',1050926,52546,1103472,'2026-10-02','2026-11-01',2,24),('40989',15500,775,16275,'2026-10-01','2026-10-16',1,1)]
-        binary=Path(os.environ.get('INVOICE_TEST_BINARY','target/debug/invoice-tracker'))
+        binary=Path(os.environ.get('INVOICE_TEST_BINARY','target/debug/sumline'))
         for path,values in zip(sorted(SAMPLES.glob('*.pdf')),expected):
             result=subprocess.run([str(binary),'--inspect',str(path)],capture_output=True,text=True,check=True);data=json.loads(result.stdout)
             actual=(data['invoice_number'],data['subtotal_cents'],data['tax_cents'],data['total_cents'],data['invoice_date'],data['due_date'],data['pages'],len(data['items']))

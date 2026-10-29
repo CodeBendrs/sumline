@@ -4,7 +4,7 @@
 # `invoice` user before the app starts, so the app itself never runs as root.
 set -eu
 data="${INVOICE_DATA_DIR:-/app/data}"
-binary="${INVOICE_BIN:-/app/invoice-tracker}"
+binary="${INVOICE_BIN:-/app/sumline}"
 mkdir -p "$data"
 if [ "$(id -u)" = "0" ]; then
   chown -R invoice:invoice "$data"

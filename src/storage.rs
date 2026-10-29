@@ -71,7 +71,7 @@ pub fn load_key(
             }
             if !allow_generate {
                 return Err(anyhow!(
-                    "No encryption key is configured. Set INVOICE_ENCRYPTION_KEY (create one with `invoice-tracker --generate-key`)"
+                    "No encryption key is configured. Set INVOICE_ENCRYPTION_KEY (create one with `sumline --generate-key`)"
                 ));
             }
             let mut key = [0u8; 32];

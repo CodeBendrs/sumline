@@ -1,5 +1,5 @@
 [package]
-name = "invoice-tracker"
+name = "sumline"
 version = "0.1.0"
 edition = "2024"
 
@@ -41,5 +41,5 @@ strip = true
 lto = "thin"
 
 [[bin]]
-name = "invoice-tracker"
+name = "sumline"
 path = "src/main.rs"

@@ -8,7 +8,7 @@
 set -eu
 destination=${1:?usage: backup.sh <backup-directory> [snapshots-to-keep]}
 keep=${2:-14}
-binary=${INVOICE_BIN:-./target/release/invoice-tracker}
+binary=${INVOICE_BIN:-./target/release/sumline}
 
 snapshot=$("$binary" --backup "$destination")
 "$binary" --verify-backup "$snapshot" >/dev/null
